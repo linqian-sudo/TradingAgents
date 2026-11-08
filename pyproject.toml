@@ -44,12 +44,13 @@ bedrock = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
+tradingagents-research = "research_entry.cli:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "research_entry*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]

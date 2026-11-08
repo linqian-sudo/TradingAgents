@@ -25,6 +25,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
+    # Read timeout forwarded to provider clients when set. None keeps each
+    # provider's own default (Google still applies its 600s fallback).
+    "TRADINGAGENTS_REQUEST_TIMEOUT":      "request_timeout",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -123,6 +126,9 @@ def build_default_config() -> dict:
         # unbounded reasoning/output and hangs or trips a gateway idle timeout
         # (e.g. some deepseek-v4-flash deployments, #1204).
         "max_tokens": None,
+        # Optional read timeout in seconds for provider clients. None leaves the
+        # provider default in place. The research entry sets this explicitly.
+        "request_timeout": None,
         # Checkpoint/resume: when True, LangGraph saves state after each node
         # so a crashed run can resume from the last successful step.
         "checkpoint_enabled": False,
