@@ -286,8 +286,21 @@ def execute_budget(
     )
 
 
-def _run_reserved_research(output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan) -> int:
-    """Run the multi-role graph only after the worst-case plan is reserved."""
+def _run_reserved_research(
+    output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan, ledger_prior=None,
+) -> int:
+    """Run the multi-role graph only after the worst-case plan is reserved.
+
+    ``ledger_prior`` is the same hold as ``prior``. The CLI passes both so a
+    renamed argument cannot crash before a status file exists. Differing
+    values are refused instead of being added together.
+    """
+    if ledger_prior is not None:
+        from research_entry.budget import _parse_money
+        if _parse_money(ledger_prior) != _parse_money(prior):
+            raise BudgetRefusal(
+                f"ledger_prior {ledger_prior} 与 prior {prior} 不一致，拒绝启动。"
+            )
     from research_entry.budget import Ledger
     from research_entry.budget_gate import install_chat_gate
     from tradingagents.graph import trading_graph
@@ -489,6 +502,33 @@ def _refuse_unbounded_research(
         )
     except BudgetRefusal as exc:
         refusal = str(exc)
+    except Exception as exc:
+        model_out = dict(model)
+        model_out["called"] = False
+        model_out["status"] = "startup_failed"
+        model_out["reason"] = f"研究尚未发送请求：{type(exc).__name__}: {exc}"
+        research = {
+            "status": "startup_failed",
+            "end_to_end": False,
+            "decision": None,
+            "reason": model_out["reason"],
+        }
+        status = build_status(
+            command="run",
+            symbol=mapped,
+            model=model_out,
+            data=not_requested_data(as_of),
+            research=research,
+            limits=limits,
+            extra={
+                "assumptions": list(ASSUMPTIONS),
+                "research_plan": plan,
+                "startup_error": f"{type(exc).__name__}: {exc}",
+                "full_research_reliable_within_budget": False,
+            },
+        )
+        write_status(output, status)
+        return 1
     model = dict(model)
     model["called"] = False
     model["status"] = "budget_refused"
