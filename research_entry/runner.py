@@ -6,6 +6,16 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from research_entry.budget import (
+    ASSUMPTIONS,
+    BudgetRefusal,
+    assess_affordability,
+    build_plan,
+    build_probe_plan,
+    conservative_probe_hold,
+    official_price_card,
+    require_endpoint,
+)
 from research_entry.data_check import check_history
 from research_entry.limits import parse_analysts, resolve_limits
 from research_entry.mapping import map_symbol
@@ -166,6 +176,246 @@ def _research_config(output: Path, provider: str, quick: str, deep: str, backend
     return config
 
 
+def _budget_status(output: Path, *, command: str, symbol, model: dict, limits: dict, extra: dict, research: dict) -> int:
+    status = build_status(
+        command=command,
+        symbol=symbol,
+        model=model,
+        data=not_requested_data(symbol.get("as_of") if symbol else None),
+        research=research,
+        limits=limits,
+        extra=extra,
+    )
+    write_status(output, status)
+    code = 0 if research.get("status") == "budget_assessed" else 2
+    return code
+
+
+def execute_budget(
+    output: Path,
+    *,
+    analysts: list[str],
+    limits: dict,
+    quick_model: str,
+    deep_model: str,
+    budget_cny: str,
+    prior_hold_cny: str | None,
+    input_token_cap: int,
+    backend_url: str | None,
+) -> int:
+    """Offline reservation math. Does not construct a model client."""
+    card = official_price_card()
+    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_probe_hold(card))
+    try:
+        require_endpoint(backend_url)
+        plan = build_plan(
+            quick_model=quick_model,
+            deep_model=deep_model,
+            analysts=analysts,
+            tool_rounds=int(limits["max_tool_rounds"]),
+            debate_rounds=int(limits["max_debate_rounds"]),
+            risk_rounds=int(limits["max_risk_discuss_rounds"]),
+            input_cap=input_token_cap,
+            output_cap=int(limits["max_tokens"]),
+            retries=int(limits["llm_max_retries"]),
+            card=card,
+        )
+        probe = build_probe_plan(card=card)
+        afford = assess_affordability(budget_cny, prior, plan)
+        probe_afford = assess_affordability(budget_cny, prior, probe)
+        flash_only = build_plan(
+            quick_model="deepseek-flash",
+            deep_model="deepseek-flash",
+            analysts=analysts,
+            tool_rounds=int(limits["max_tool_rounds"]),
+            debate_rounds=int(limits["max_debate_rounds"]),
+            risk_rounds=int(limits["max_risk_discuss_rounds"]),
+            input_cap=input_token_cap,
+            output_cap=int(limits["max_tokens"]),
+            retries=0,
+            card=card,
+        )
+        flash_only_afford = assess_affordability(budget_cny, prior, flash_only)
+    except BudgetRefusal as exc:
+        plan = {"completion_guaranteed": False, "completion_blocker": str(exc)}
+        probe = None
+        afford = {"send_allowed": False, "fits_reservation": False}
+        probe_afford = {"send_allowed": False}
+        flash_only = None
+        flash_only_afford = None
+        refusal = str(exc)
+    else:
+        refusal = None
+    research = {
+        "status": "budget_assessed",
+        "end_to_end": False,
+        "decision": None,
+        "reason": (
+            "完整研究不能在当前总预算内被证明可以结束。"
+            if not (plan or {}).get("completion_guaranteed")
+            else "方案有上界。"
+        ),
+    }
+    model = {
+        "status": "not_called",
+        "provider": "deepseek",
+        "quick_model": quick_model,
+        "deep_model": deep_model,
+        "called": False,
+        "reason": "预算核算没有构造模型客户端，也没有读取 API Key。",
+    }
+    extra = {
+        "assumptions": list(ASSUMPTIONS),
+        "price_source": card.source,
+        "price_retrieved_at": card.retrieved_at,
+        "price_expires_at": card.expires_at,
+        "price_digest": card.digest(),
+        "research_plan": plan,
+        "research_affordability": afford,
+        "minimum_probe": probe,
+        "minimum_probe_affordability": probe_afford,
+        "flash_only_plan": flash_only,
+        "flash_only_affordability": flash_only_afford,
+        "refusal": refusal,
+        "full_research_reliable_within_budget": False,
+    }
+    return _budget_status(
+        output, command="budget", symbol=None, model=model, limits=limits, extra=extra, research=research,
+    )
+
+
+def _send_reserved_probe(ledger, probe: dict):
+    """One already-reserved chat completion. Tests replace this or the client."""
+    import os
+
+    from research_entry.budget_gate import install_budget_gate
+    from tradingagents.llm_clients.openai_client import DeepSeekChatOpenAI
+
+    llm = DeepSeekChatOpenAI(
+        model=probe["model"],
+        api_key=os.environ.get("DEEPSEEK_API_KEY") or "",
+        max_retries=0,
+        base_url="https://api.deepseek.com",
+    )
+    install_budget_gate(llm, ledger)
+    return llm.client.create(
+        model=probe["model"],
+        messages=[{"role": "user", "content": "ok"}],
+        max_tokens=int(probe["output_cap"]),
+    )
+
+
+def _refuse_unbounded_research(
+    output: Path,
+    *,
+    mapped: dict,
+    model: dict,
+    limits: dict,
+    chosen: list[str],
+    as_of: str,
+    budget_cny: str | None,
+    prior_hold_cny: str | None,
+    input_token_cap: int | None,
+    backend_url: str | None,
+    budget_mode: str,
+) -> int:
+    """DeepSeek research is not sent until a complete ceiling is proven."""
+    card = official_price_card()
+    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_probe_hold(card))
+    cap = int(input_token_cap or 8192)
+    refusal = None
+    plan = None
+    afford = None
+    probe = None
+    probe_afford = None
+    try:
+        require_endpoint(backend_url)
+        if (model.get("provider") or "") != "deepseek":
+            raise BudgetRefusal("带预算的运行只接受价格卡中的 DeepSeek 模型，拒绝发送。")
+        if budget_cny in (None, ""):
+            raise BudgetRefusal("未设置单次总预算。DeepSeek 运行拒绝发送。")
+        if int(limits["llm_max_retries"]) != 0:
+            raise BudgetRefusal("预算运行禁止隐式重试。请把重试设为 0。")
+        plan = build_plan(
+            quick_model=model["quick_model"],
+            deep_model=model["deep_model"],
+            analysts=chosen,
+            tool_rounds=int(limits["max_tool_rounds"]),
+            debate_rounds=int(limits["max_debate_rounds"]),
+            risk_rounds=int(limits["max_risk_discuss_rounds"]),
+            input_cap=cap,
+            output_cap=int(limits["max_tokens"]),
+            retries=0,
+            card=card,
+        )
+        probe = build_probe_plan(card=card)
+        afford = assess_affordability(budget_cny, prior, plan)
+        probe_afford = assess_affordability(budget_cny, prior, probe)
+        if budget_mode == "probe":
+            if not probe_afford["send_allowed"]:
+                raise BudgetRefusal("单次探测的保守预留超过剩余预算，拒绝发送。")
+            from research_entry.budget import Ledger
+
+            ledger = Ledger(output / "budget-ledger.json", budget_cny, prior, card)
+            ledger.reserve(probe, "minimum-probe")
+            _send_reserved_probe(ledger, probe)
+            model_out = dict(model)
+            model_out["called"] = True
+            model_out["status"] = "probe_sent"
+            model_out["reason"] = "只发送了一次已预留的探测请求，不是完整研究。"
+            research = {
+                "status": "probe_sent",
+                "end_to_end": False,
+                "decision": None,
+                "reason": "探测请求不能当作研判结论。",
+            }
+            status = build_status(
+                command="run",
+                symbol=mapped,
+                model=model_out,
+                data=not_requested_data(as_of),
+                research=research,
+                limits=limits,
+                extra={"ledger": ledger.snapshot(), "minimum_probe": probe, "assumptions": list(ASSUMPTIONS)},
+            )
+            write_status(output, status)
+            return 0
+        raise BudgetRefusal(plan["completion_blocker"])
+    except BudgetRefusal as exc:
+        refusal = str(exc)
+    model = dict(model)
+    model["called"] = False
+    model["status"] = "budget_refused"
+    model["reason"] = refusal
+    research = {
+        "status": "budget_refused",
+        "end_to_end": False,
+        "decision": None,
+        "reason": refusal,
+    }
+    status = build_status(
+        command="run",
+        symbol=mapped,
+        model=model,
+        data=not_requested_data(as_of),
+        research=research,
+        limits=limits,
+        extra={
+            "assumptions": list(ASSUMPTIONS),
+            "price_source": card.source,
+            "price_expires_at": card.expires_at,
+            "research_plan": plan,
+            "research_affordability": afford,
+            "minimum_probe": probe,
+            "minimum_probe_affordability": probe_afford,
+            "full_research_reliable_within_budget": False,
+            "budget_mode": budget_mode,
+        },
+    )
+    write_status(output, status)
+    return 2
+
+
 def execute_run(
     output: Path,
     symbol: str,
@@ -179,6 +429,10 @@ def execute_run(
     analysts: str | None,
     limit_overrides: dict,
     environ: dict,
+    budget_cny: str | None = None,
+    prior_hold_cny: str | None = None,
+    input_token_cap: int | None = None,
+    budget_mode: str = "research",
 ) -> int:
     as_of = _parse_date(as_of)
     mapped = map_symbol(symbol, market)
@@ -222,6 +476,22 @@ def execute_run(
         )
         write_status(output, status)
         return 2
+
+    provider_name = (model.get("provider") or "").lower()
+    if provider_name == "deepseek" or budget_cny not in (None, ""):
+        return _refuse_unbounded_research(
+            output,
+            mapped=mapped,
+            model=model,
+            limits=limits,
+            chosen=chosen,
+            as_of=as_of,
+            budget_cny=budget_cny,
+            prior_hold_cny=prior_hold_cny,
+            input_token_cap=input_token_cap,
+            backend_url=backend_url,
+            budget_mode=budget_mode,
+        )
 
     # Imported only after the gate, so a missing key never constructs a client.
     import os

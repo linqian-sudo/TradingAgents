@@ -30,6 +30,8 @@ echo "research CLI help"
 
 echo "symbol map"
 "$BIN" map --reference --output "$OUT/map"
+echo "budget assessment"
+"$BIN" budget --output "$OUT/budget" --max-retries 0
 AS_OF="$(date -u -d 'yesterday' +%F)"
 echo "unconfigured run for $AS_OF (expect exit 2)"
 set +e

@@ -11,8 +11,15 @@ import os
 import sys
 from pathlib import Path
 
+from research_entry.budget import conservative_probe_hold
 from research_entry.limits import DEFAULT_LIMITS
-from research_entry.runner import execute_data_check, execute_map, execute_preflight, execute_run
+from research_entry.runner import (
+    execute_budget,
+    execute_data_check,
+    execute_map,
+    execute_preflight,
+    execute_run,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -62,6 +69,24 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-tokens", type=int, default=DEFAULT_LIMITS["max_tokens"])
     run.add_argument("--timeout", type=float, default=DEFAULT_LIMITS["request_timeout"])
     run.add_argument("--max-retries", type=int, default=DEFAULT_LIMITS["llm_max_retries"])
+    run.add_argument("--budget-cny", help="本次总预算，人民币，十进制字符串")
+    run.add_argument("--prior-hold-cny", help="先前占用。默认按基础探测的高峰未命中预留")
+    run.add_argument("--input-token-cap", type=int, default=8192)
+    run.add_argument("--budget-mode", choices=("research", "probe"), default="research")
+
+    budget = sub.add_parser("budget", help="只核算预算，不构造模型客户端")
+    budget.add_argument("--output", required=True)
+    budget.add_argument("--quick-model", default="deepseek-flash")
+    budget.add_argument("--deep-model", default="deepseek-v4-pro")
+    budget.add_argument("--analysts", default="market")
+    budget.add_argument("--budget-cny", default="1")
+    budget.add_argument("--prior-hold-cny", default=None)
+    budget.add_argument("--input-token-cap", type=int, default=8192)
+    budget.add_argument("--max-debate-rounds", type=int, default=DEFAULT_LIMITS["max_debate_rounds"])
+    budget.add_argument("--max-risk-rounds", type=int, default=DEFAULT_LIMITS["max_risk_discuss_rounds"])
+    budget.add_argument("--max-tool-rounds", type=int, default=DEFAULT_LIMITS["max_tool_rounds"])
+    budget.add_argument("--max-tokens", type=int, default=DEFAULT_LIMITS["max_tokens"])
+    budget.add_argument("--max-retries", type=int, default=0)
     return parser
 
 
@@ -99,6 +124,29 @@ def main(argv: list[str] | None = None) -> None:
                     "llm_max_retries": args.max_retries,
                 },
                 environ=dict(os.environ),
+                budget_cny=args.budget_cny or os.environ.get("TRADINGAGENTS_BUDGET_CNY"),
+                prior_hold_cny=args.prior_hold_cny or os.environ.get("TRADINGAGENTS_PRIOR_HOLD_CNY"),
+                input_token_cap=args.input_token_cap,
+                budget_mode=args.budget_mode,
+            )
+        elif args.command == "budget":
+            from research_entry.limits import parse_analysts, resolve_limits
+            code = execute_budget(
+                output,
+                analysts=parse_analysts(args.analysts),
+                limits=resolve_limits({
+                    "max_debate_rounds": args.max_debate_rounds,
+                    "max_risk_discuss_rounds": args.max_risk_rounds,
+                    "max_tool_rounds": args.max_tool_rounds,
+                    "max_tokens": args.max_tokens,
+                    "llm_max_retries": args.max_retries,
+                }),
+                quick_model=args.quick_model,
+                deep_model=args.deep_model,
+                budget_cny=args.budget_cny,
+                prior_hold_cny=args.prior_hold_cny or str(conservative_probe_hold()),
+                input_token_cap=args.input_token_cap,
+                backend_url=None,
             )
         else:
             parser.error(f"未知命令 {args.command}")
