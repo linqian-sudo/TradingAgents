@@ -832,6 +832,25 @@ def known_settled_usage(state: dict) -> Decimal:
     return _money(total)
 
 
+_DANGEROUS_SLOT = frozenset({"usage_missing", "sending", "overrun"})
+
+
+def dangerous_slots(state: dict) -> list[dict]:
+    """Slots a legacy ledger left unfinished. Their presence freezes inheritance."""
+    found = []
+    for index, slot in enumerate(state.get("slots") or []):
+        if not isinstance(slot, dict):
+            continue
+        status = slot.get("status")
+        if status in _DANGEROUS_SLOT:
+            found.append({
+                "index": index,
+                "status": status,
+                "charged_cny": slot.get("charged_cny"),
+            })
+    return found
+
+
 def inherit_frozen_ledger(
     old_path: Path,
     *,
@@ -839,32 +858,45 @@ def inherit_frozen_ledger(
     budget_cny: str,
     new_reserved_cny: str,
     stated_prior: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict:
-    """Read a frozen ledger and inherit its full conservative hold.
+    """Read a ledger and inherit its full conservative hold without rewriting it.
 
-    Does not unfreeze, delete, or rewrite the old ledger or any lock file.
-    A new run may reserve only in a different file, and only when
-    inherited hold plus the new plan still fit the same total budget.
+    A legacy file can still say ``frozen: false`` while slots are
+    ``usage_missing``, ``sending``, or ``overrun``. That file is treated as
+    frozen in the migration sidecar only. The source bytes stay as they are.
     """
     old_path = Path(old_path).resolve()
     new_ledger_path = Path(new_ledger_path).resolve()
     if old_path == new_ledger_path:
-        raise BudgetRefusal("新账本不能写在已冻结的旧账本上，也不能把旧账本改成未冻结。")
+        raise BudgetRefusal("新账本不能写在旧账本上，也不能改写旧账本。")
     if not old_path.is_file():
         raise BudgetRefusal(f"找不到旧账本 {old_path}，拒绝续测。")
+    if not expected_sha256 or not str(expected_sha256).strip():
+        raise BudgetRefusal(
+            "继承必须带账本哈希，避免换用另一本不含最新预留的账本。"
+        )
     before = sha256_file(old_path)
     raw = old_path.read_bytes()
     if hashlib.sha256(raw).hexdigest() != before:
         raise BudgetRefusal("读取旧账本时内容变化，拒绝续测。")
+    wanted = str(expected_sha256).strip().lower()
+    if wanted != before:
+        raise BudgetRefusal(
+            f"旧账本哈希 {before} 与声明的 {wanted} 不一致，拒绝续测。"
+        )
     try:
         state = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise BudgetRefusal("旧账本不是可读的 JSON，拒绝续测。") from exc
     if not isinstance(state, dict) or not state.get("run_id"):
         raise BudgetRefusal("旧账本没有已入账的运行，拒绝续测。")
-    if state.get("frozen") is not True:
+    hazards = dangerous_slots(state)
+    field_frozen = state.get("frozen") is True
+    if not field_frozen and not hazards:
         raise BudgetRefusal(
-            "旧账本未冻结。不能另开一本并行发送，也不能为了续测去改写它。"
+            "旧账本字段 frozen 不是 true，也没有 usage_missing、sending 或 overrun。"
+            "它可能仍会发送。不能另开账本，也不会为了通过检查去改写它。"
         )
     occupation = _money(conservative_occupation(state))
     known = known_settled_usage(state)
@@ -895,12 +927,35 @@ def inherit_frozen_ledger(
         })
     if sha256_file(old_path) != before or old_path.read_bytes() != raw:
         raise BudgetRefusal("确认继承时旧账本已被改写，拒绝续测。")
+    migration = {
+        "source_ledger_path": str(old_path),
+        "source_ledger_sha256": before,
+        "source_frozen_field": state.get("frozen"),
+        "effective_frozen": True,
+        "effective_freeze_reason": (
+            "field_frozen" if field_frozen and not hazards else "legacy_dangerous_slots"
+        ),
+        "dangerous_slots": hazards,
+        "source_file_modified": False,
+        "unknown_released": False,
+        "known_usage_cny_reported_not_added": _plain(known),
+        "inherited_hold_cny": _plain(occupation),
+        "note": (
+            "迁移只写在新目录。原账本字节不改，即使 frozen 字段仍是 false。"
+            "usage_missing、sending、overrun 按整笔 prior+reserved 继承，不按已知 usage 少扣。"
+        ),
+    }
     return {
-        "acknowledgment": "旧账本保持冻结。未删除、未改写、未释放 unknown。新账本只继承整笔保守占用。",
+        "acknowledgment": (
+            "原账本字节未改。存在 usage_missing、sending、overrun，或字段 frozen 为 true 时，"
+            "只在新目录的迁移清单里视为已冻结，并继承 prior+reserved 全额。"
+            "unknown 不释放。已知 usage 只写入报告，不另扣。"
+        ),
         "old_ledger_path": str(old_path),
         "old_ledger_sha256": before,
         "old_ledger_bytes": len(raw),
-        "old_frozen": True,
+        "old_frozen_field": state.get("frozen"),
+        "effective_frozen": True,
         "old_freeze_reason": state.get("freeze_reason"),
         "old_run_id": state.get("run_id"),
         "old_budget_cny": state.get("budget_cny"),
@@ -916,6 +971,7 @@ def inherit_frozen_ledger(
         "cumulative_conservative_cny": _plain(cumulative),
         "budget_cny": _plain(budget),
         "fits_budget": True,
+        "migration": migration,
     }
 
 

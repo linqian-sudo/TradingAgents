@@ -29,59 +29,103 @@ _RUN = [
 ]
 
 
-def _frozen(path: Path, *, frozen: bool = True) -> None:
+def _legacy(path: Path, *, slots: list | None = None, frozen: bool = False) -> None:
+    """A pre-fix ledger: frozen stays false unless the caller says otherwise."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "run_id": "previous-tencent",
         "frozen": frozen,
-        "freeze_reason": "usage_missing",
         "budget_cny": "9.5",
         "prior_hold_cny": "1.959598",
         "reserved_cny": "0.955264",
-        "slots": [
-            {"status": "settled", "charged_cny": "0.156340", "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
-            {"status": "usage_missing", "charged_cny": "0.056192", "freeze_reason": "usage_missing"},
+        "slots": slots if slots is not None else [
+            {"status": "settled", "charged_cny": "0.156340", "usage": {"prompt_tokens": 22835, "completion_tokens": 8756}},
+            {"status": "usage_missing", "charged_cny": "0.056192"},
+            {"status": "sending"},
         ],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def test_understated_prior_and_unfrozen_ledger_are_refused(tmp_path):
+def test_legacy_unfrozen_ledger_with_dangerous_slots_inherits_without_a_rewrite(tmp_path):
     old = tmp_path / "old" / "budget-ledger.json"
-    old.parent.mkdir()
-    _frozen(old)
+    _legacy(old)
+    before = old.read_bytes()
+    digest = sha256_file(old)
+    with pytest.raises(BudgetRefusal, match="必须带账本哈希"):
+        inherit_frozen_ledger(
+            old, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
+            budget_cny="9.5", new_reserved_cny="1.130752",
+        )
+    with pytest.raises(BudgetRefusal, match="不一致"):
+        inherit_frozen_ledger(
+            old, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
+            budget_cny="9.5", new_reserved_cny="1.130752",
+            expected_sha256="0" * 64,
+        )
+    manifest = inherit_frozen_ledger(
+        old, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
+        budget_cny="9.5", new_reserved_cny="1.130752", expected_sha256=digest,
+    )
+    assert manifest["old_frozen_field"] is False
+    assert manifest["effective_frozen"] is True
+    assert manifest["migration"]["effective_freeze_reason"] == "legacy_dangerous_slots"
+    statuses = {slot["status"] for slot in manifest["migration"]["dangerous_slots"]}
+    assert statuses == {"usage_missing", "sending"}
+    assert Decimal(manifest["inherited_hold_cny"]) == Decimal("2.914862")
+    assert Decimal(manifest["known_usage_cny_not_added"]) == Decimal("0.156340")
+    assert Decimal(manifest["cumulative_conservative_cny"]) == Decimal("4.045614")
+    assert manifest["unknown_released"] is False
+    assert old.read_bytes() == before
+    overrun = tmp_path / "over" / "budget-ledger.json"
+    _legacy(overrun, slots=[{"status": "overrun", "charged_cny": "0.200000"}], frozen=False)
+    over_before = overrun.read_bytes()
+    over = inherit_frozen_ledger(
+        overrun, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
+        budget_cny="9.5", new_reserved_cny="1.130752", expected_sha256=sha256_file(overrun),
+    )
+    assert over["migration"]["dangerous_slots"][0]["status"] == "overrun"
+    assert overrun.read_bytes() == over_before
+
+
+def test_understated_prior_and_live_ledger_are_refused(tmp_path):
+    old = tmp_path / "old" / "budget-ledger.json"
+    _legacy(old)
     lock = old.parent / "budget-ledger.lock"
     lock.write_text("held\n", encoding="utf-8")
     before = old.read_bytes()
     lock_before = lock.read_bytes()
-    with pytest.raises(BudgetRefusal, match="不一致"):
+    digest = sha256_file(old)
+    with pytest.raises(BudgetRefusal, match="不能少算"):
         inherit_frozen_ledger(
             old, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
             budget_cny="9.5", new_reserved_cny="1.130752", stated_prior="1.959598",
+            expected_sha256=digest,
         )
     plain = tmp_path / "plain" / "budget-ledger.json"
-    plain.parent.mkdir()
-    _frozen(plain, frozen=False)
+    _legacy(plain, slots=[{"status": "settled", "charged_cny": "0.010000"}, {"status": "reserved"}], frozen=False)
     plain_before = plain.read_bytes()
-    with pytest.raises(BudgetRefusal, match="未冻结"):
+    with pytest.raises(BudgetRefusal, match="可能仍会发送"):
         inherit_frozen_ledger(
             plain, new_ledger_path=tmp_path / "new" / "budget-ledger.json",
-            budget_cny="9.5", new_reserved_cny="1.130752",
+            budget_cny="9.5", new_reserved_cny="1.130752", expected_sha256=sha256_file(plain),
         )
-    with pytest.raises(BudgetRefusal, match="不能写在已冻结"):
+    with pytest.raises(BudgetRefusal, match="不能写在旧账本"):
         inherit_frozen_ledger(
             old, new_ledger_path=old, budget_cny="9.5", new_reserved_cny="1.130752",
+            expected_sha256=digest,
         )
     assert old.read_bytes() == before
     assert lock.read_bytes() == lock_before
     assert plain.read_bytes() == plain_before
 
 
-def test_cli_inherits_full_hold_without_rewriting_the_frozen_ledger(tmp_path, monkeypatch):
+def test_cli_inherits_legacy_unfrozen_ledger_without_rewriting_it(tmp_path, monkeypatch):
     _offline(monkeypatch)
     old_dir = tmp_path / "old"
-    old_dir.mkdir()
     old = old_dir / "budget-ledger.json"
-    _frozen(old)
+    _legacy(old)
     (old_dir / "budget-ledger.lock").write_text("held\n", encoding="utf-8")
+    before_bytes = old.read_bytes()
     before = sha256_file(old)
     scripted = ScriptedModel(structured=True)
 
@@ -96,9 +140,17 @@ def test_cli_inherits_full_hold_without_rewriting_the_frozen_ledger(tmp_path, mo
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-not-real")
     new = tmp_path / "next"
     with pytest.raises(SystemExit) as exc:
-        main([*_RUN, "--output", str(new), "--inherit-frozen-ledger", str(old)])
+        main([
+            *_RUN, "--output", str(new), "--inherit-frozen-ledger", str(old),
+            "--expect-ledger-sha256", before,
+        ])
     assert exc.value.code == 0
     manifest = json.loads((new / "inheritance-manifest.json").read_text(encoding="utf-8"))
+    migration = json.loads((new / "legacy-migration.json").read_text(encoding="utf-8"))
+    assert manifest["old_frozen_field"] is False
+    assert migration["source_frozen_field"] is False
+    assert migration["effective_frozen"] is True
+    assert {slot["status"] for slot in migration["dangerous_slots"]} == {"usage_missing", "sending"}
     assert Decimal(manifest["inherited_hold_cny"]) == Decimal("2.914862")
     assert Decimal(manifest["known_usage_cny_not_added"]) == Decimal("0.156340")
     assert Decimal(manifest["new_reserved_cny"]) == Decimal("1.130752")
@@ -107,8 +159,8 @@ def test_cli_inherits_full_hold_without_rewriting_the_frozen_ledger(tmp_path, mo
     assert manifest["old_file_modified"] is False
     assert manifest["old_ledger_sha256"] == before
     assert manifest["lock_files"][0]["sha256"] == sha256_file(old_dir / "budget-ledger.lock")
-    assert sha256_file(old) == before
-    assert json.loads(old.read_text(encoding="utf-8"))["frozen"] is True
+    assert old.read_bytes() == before_bytes
+    assert json.loads(old.read_text(encoding="utf-8"))["frozen"] is False
     status = json.loads((new / "status.json").read_text(encoding="utf-8"))
     assert status["extra"]["ledger"]["prior_hold_cny"].startswith("2.914862")
     assert status["extra"]["ledger"]["frozen"] is False

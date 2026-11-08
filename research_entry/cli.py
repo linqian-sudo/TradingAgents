@@ -79,7 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--prior-hold-cny", help="先前占用。续测时由 --inherit-frozen-ledger 计算，不要手写一个更小的数")
     run.add_argument(
         "--inherit-frozen-ledger",
-        help="已冻结旧账本的路径。只读继承整笔保守占用，不解除冻结、不删除、不释放 unknown",
+        help="旧账本路径。只读继承 prior+reserved。frozen 为 false 但含 usage_missing、sending 或 overrun 时，只在新目录视为已冻结",
+    )
+    run.add_argument(
+        "--expect-ledger-sha256",
+        help="旧账本文件的 SHA256。必须与路径上的字节一致，避免换用另一本账",
     )
     run.add_argument("--input-token-cap", type=int, default=8192)
     run.add_argument("--budget-mode", choices=("research", "probe"), default="research")
@@ -138,6 +142,9 @@ def main(argv: list[str] | None = None) -> None:
                 prior_hold_cny=args.prior_hold_cny or os.environ.get("TRADINGAGENTS_PRIOR_HOLD_CNY"),
                 inherit_frozen_ledger_path=(
                     args.inherit_frozen_ledger or os.environ.get("TRADINGAGENTS_INHERIT_FROZEN_LEDGER")
+                ),
+                expected_ledger_sha256=(
+                    args.expect_ledger_sha256 or os.environ.get("TRADINGAGENTS_EXPECT_LEDGER_SHA256")
                 ),
                 input_token_cap=args.input_token_cap,
                 budget_mode=args.budget_mode,

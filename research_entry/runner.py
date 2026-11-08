@@ -564,6 +564,7 @@ def _refuse_unbounded_research(
     backend_url: str | None,
     budget_mode: str,
     inherit_frozen_ledger_path: str | None = None,
+    expected_ledger_sha256: str | None = None,
 ) -> int:
     """DeepSeek research is not sent until a complete ceiling is proven."""
     card = official_price_card()
@@ -606,12 +607,20 @@ def _refuse_unbounded_research(
                 budget_cny=budget_cny,
                 new_reserved_cny=plan["reserved_cny"] if budget_mode != "probe" else probe["reserved_cny"],
                 stated_prior=prior_hold_cny,
+                expected_sha256=expected_ledger_sha256,
             )
             prior = inheritance["inherited_hold_cny"]
             atomic_write(
                 output / "inheritance-manifest.json",
                 json.dumps(inheritance, ensure_ascii=False, indent=2) + "\n",
             )
+            atomic_write(
+                output / "legacy-migration.json",
+                json.dumps(inheritance["migration"], ensure_ascii=False, indent=2) + "\n",
+            )
+            from research_entry.budget import sha256_file
+            if sha256_file(inherit_frozen_ledger_path) != inheritance["old_ledger_sha256"]:
+                raise BudgetRefusal("写出迁移清单后旧账本哈希变了，拒绝启动。")
         afford = assess_affordability(budget_cny, prior, plan)
         probe_afford = assess_affordability(budget_cny, prior, probe)
         if budget_mode == "probe":
@@ -733,6 +742,7 @@ def execute_run(
     input_token_cap: int | None = None,
     budget_mode: str = "research",
     inherit_frozen_ledger_path: str | None = None,
+    expected_ledger_sha256: str | None = None,
 ) -> int:
     as_of = _parse_date(as_of)
     mapped = map_symbol(symbol, market)
@@ -792,6 +802,7 @@ def execute_run(
             backend_url=backend_url,
             budget_mode=budget_mode,
             inherit_frozen_ledger_path=inherit_frozen_ledger_path,
+            expected_ledger_sha256=expected_ledger_sha256,
         )
 
     # Imported only after the gate, so a missing key never constructs a client.
