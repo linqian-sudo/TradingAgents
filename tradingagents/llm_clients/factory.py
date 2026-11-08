@@ -74,6 +74,25 @@ def _coerce_max_retries(value):
     return n
 
 
+def _coerce_request_timeout(value):
+    """Validate a ``request_timeout`` value to a positive number of seconds.
+
+    Accepts an int, a float, or a numeric string (env vars arrive as strings).
+    Rejects booleans, zero, and negatives so a mis-set timeout fails at startup.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"request_timeout must be a number of seconds, not a boolean: {value!r}")
+    try:
+        n = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"request_timeout must be a positive number of seconds, got {value!r}") from exc
+    if n <= 0:
+        raise ValueError(f"request_timeout must be > 0, got {n}")
+    if n.is_integer():
+        return int(n)
+    return n
+
+
 def _coerce_max_tokens(value):
     """Validate a ``max_tokens`` value to a positive int (env vars are strings)."""
     if isinstance(value, bool):
@@ -130,6 +149,12 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
     if max_tokens is not None and max_tokens != "":
         key = "max_output_tokens" if provider == "google" else "max_tokens"
         kwargs[key] = _coerce_max_tokens(max_tokens)
+
+    # Read timeout is cross-provider. Forward it only when explicitly set so
+    # Google keeps its own 600s fallback and other providers keep their SDK default.
+    request_timeout = config.get("request_timeout")
+    if request_timeout is not None and request_timeout != "":
+        kwargs["timeout"] = _coerce_request_timeout(request_timeout)
 
     return kwargs
 

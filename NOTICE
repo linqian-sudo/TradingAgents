@@ -1,0 +1,11 @@
+TradingAgents
+Copyright Tauric Research
+
+This distribution is based on TradingAgents 0.7.1
+(upstream commit 9fa1196fffbcfd9de5146d2dd2869df84ab99838),
+licensed under the Apache License, Version 2.0. The license text is in LICENSE.
+
+The research_entry package and the deploy scripts are a research-only wrapper
+added for an isolated install. They do not change the Apache-2.0 terms.
+The wrapper does not connect to a broker, submit orders, read portfolios,
+send Feishu messages, or schedule jobs.
