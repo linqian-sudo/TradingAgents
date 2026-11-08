@@ -9,7 +9,13 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import ConfigDict, Field
 
-from research_entry.budget import BudgetRefusal, Ledger, prepare_for_send, tool_schema
+from research_entry.budget import (
+    BudgetRefusal,
+    Ledger,
+    pin_deepseek_request,
+    prepare_for_send,
+    tool_schema,
+)
 
 _PERMIT = threading.local()
 
@@ -101,8 +107,20 @@ def _wrap_resource(resource, llm, ledger: Ledger) -> None:
                 setattr(resource, name, refuse)
 
 
-def guard_transport(llm) -> None:
-    """Reject a completion create that did not just pass through the chat ledger."""
+def _install_payload_pin(llm, output_cap: int) -> None:
+    original = getattr(llm, "_get_request_payload", None)
+    if original is None or getattr(original, "_budget_payload_pin", False):
+        return
+
+    def _get_request_payload(input_, *, stop=None, **kwargs):
+        return pin_deepseek_request(original(input_, stop=stop, **kwargs), output_cap)
+
+    _get_request_payload._budget_payload_pin = True
+    llm._get_request_payload = _get_request_payload
+
+
+def guard_transport(llm, output_cap: int) -> None:
+    """Rewrite the body, then reject a create that has no reservation."""
     client = getattr(llm, "client", None)
     if client is None or not hasattr(client, "create"):
         return
@@ -111,8 +129,11 @@ def guard_transport(llm) -> None:
         return
 
     def guarded(*args, **kwargs):
+        if args:
+            raise BudgetRefusal("位置参数调用无法核对输出上限，拒绝发送。")
+        pinned = pin_deepseek_request(kwargs, output_cap)
         consume_transport_permit()
-        return current(*args, **kwargs)
+        return current(**pinned)
 
     guarded._budget_transport_guard = True
     client.create = guarded
@@ -120,7 +141,8 @@ def guard_transport(llm) -> None:
 
 def install_chat_gate(llm, ledger: Ledger, *, input_cap: int, output_cap: int, expected_model: str):
     """Return the model the graph must use. Direct creates without a permit fail."""
-    guard_transport(llm)
+    _install_payload_pin(llm, output_cap)
+    guard_transport(llm, output_cap)
     return BudgetedChatModel(
         inner=llm,
         ledger=ledger,
@@ -252,8 +274,10 @@ class BudgetedChatModel(BaseChatModel):
             truncated=truncated,
         )
         _open_permit()
+        call_kwargs = dict(kwargs)
+        call_kwargs["max_tokens"] = max_tokens
         try:
-            result = self.inner._generate(prepared, stop=stop, run_manager=run_manager, **kwargs)
+            result = self.inner._generate(prepared, stop=stop, run_manager=run_manager, **call_kwargs)
         except Exception:
             self.ledger.abort(index)
             raise

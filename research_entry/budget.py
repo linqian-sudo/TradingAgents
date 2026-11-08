@@ -252,7 +252,9 @@ def request_token_upper_bound(messages, tools=None) -> int:
 ASSUMPTIONS = (
     "价格卡是 2026-11-08 官方中文页的人民币高峰价，缓存一律按未命中。过期、改价或未知模型拒绝发送。这不能约束 DeepSeek 日后的扣费政策。",
     "只覆盖官方 OpenAI Chat Completions（https://api.deepseek.com）。流式、Responses、Anthropic 格式、FIM、Search/Fetch 和旧模型名都拒绝。",
-    "思考模式必须显式关闭。官方没有写明推理 token 一定被 max_tokens 包含；不关闭则拒绝。输出上界就是这次请求里的 max_tokens。",
+    "思考模式必须在即将发出的请求体里写成 thinking.type=disabled，输出上限必须写成官方字段 max_tokens。只在账本里记下 1024 并不等于供应商收到了这个上限。",
+    "completion_tokens 按单次响应记账，不把多次相加后再当成一次。reasoning_tokens 只作明细，不重复加到 completion_tokens 上。",
+    "请求发出后如果供应商返回的 completion_tokens 仍大于 max_tokens，费用无法撤回。账本会冻结并停止后续请求。这不是对 9.5 元账单的绝对保证。",
     "输入上界是载荷文本的 UTF-8 字节数，再加每条消息和每个工具 128 token 的模板余量。非文本内容拒绝。该字节上界依赖“一个 UTF-8 字节至多一个 token”。",
     "SDK 隐式重试必须为 0。计划外调用、usage 缺失都不退预留，也不再追加调用。",
     "完整研究按每次请求的输入上界和 max_tokens 预留，不按 100 万上下文预留。上界装不进剩余预算，或压缩后仍超过上界，就在发送前拒绝。",
@@ -332,6 +334,36 @@ def _shrink_text(text: str, head_lines: int, tail_lines: int) -> str:
     if TRUNCATION_BANNER not in body:
         body = text[:200] + TRUNCATION_BANNER
     return body
+
+
+def pin_deepseek_request(payload: dict, output_cap: int) -> dict:
+    """Force the documented output cap onto the body that is about to be sent.
+
+    LangChain renames ``max_tokens`` to ``max_completion_tokens``. DeepSeek's
+    published chat schema names the limit ``max_tokens`` and enables thinking
+    when that field and ``thinking`` are both omitted. The ledger's 1024 is
+    not a cap unless those documented fields are actually present.
+    """
+    if not isinstance(payload, dict):
+        raise BudgetRefusal("请求载荷不是对象，拒绝发送。")
+    if output_cap < 1 or output_cap > OUTPUT_TOKEN_CEILING:
+        raise BudgetRefusal(f"输出上界 {output_cap} 不在可发送范围内，拒绝发送。")
+    pinned = dict(payload)
+    extra = dict(pinned.get("extra_body") or {})
+    thinking = extra.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        raise BudgetRefusal("思考模式已打开，拒绝发送。")
+    if pinned.get("reasoning_effort") not in (None, "none"):
+        raise BudgetRefusal("reasoning_effort 不是 none，拒绝发送。")
+    extra["thinking"] = {"type": "disabled"}
+    pinned["extra_body"] = extra
+    pinned["reasoning_effort"] = "none"
+    pinned["max_tokens"] = output_cap
+    if "max_completion_tokens" in pinned:
+        pinned["max_completion_tokens"] = output_cap
+    if pinned.get("max_tokens") != output_cap or pinned["extra_body"]["thinking"]["type"] != "disabled":
+        raise BudgetRefusal("无法把 max_tokens 和关闭思考写入请求，拒绝发送。")
+    return pinned
 
 
 def prepare_for_send(messages, tools, input_cap: int):
@@ -667,10 +699,17 @@ class Ledger:
                 slot["charged_cny"] = str(reserved)
                 self._write(state)
                 return
+            details = usage.get("completion_tokens_details") or {}
+            reasoning = details.get("reasoning_tokens")
+            if isinstance(reasoning, bool) or (reasoning is not None and not isinstance(reasoning, int)):
+                reasoning = None
             actual = call_cost(self.card, slot["model"], prompt, completion)
+            # completion_tokens is the billed size we were given. reasoning_tokens
+            # is recorded beside it and is not added again.
             slot["usage"] = {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
+                "reasoning_tokens": reasoning,
             }
             if actual > reserved or prompt > slot["input_cap"] or completion > slot["output_cap"]:
                 slot["status"] = "overrun"
