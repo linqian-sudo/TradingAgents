@@ -12,7 +12,7 @@ from research_entry.budget import (
     assess_affordability,
     build_plan,
     build_probe_plan,
-    conservative_probe_hold,
+    conservative_prior_reservation_hold,
     official_price_card,
     require_endpoint,
 )
@@ -205,7 +205,7 @@ def execute_budget(
 ) -> int:
     """Offline reservation math. Does not construct a model client."""
     card = official_price_card()
-    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_probe_hold(card))
+    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_prior_reservation_hold(card))
     try:
         require_endpoint(backend_url)
         plan = build_plan(
@@ -251,9 +251,11 @@ def execute_budget(
         "end_to_end": False,
         "decision": None,
         "reason": (
-            "完整研究不能在当前总预算内被证明可以结束。"
-            if not (plan or {}).get("completion_guaranteed")
-            else "方案有上界。"
+            "最坏预留没有超过剩余预算，可以按输入上界尝试多角色研究。"
+            "某次请求无法压进上界时会在发送前拒绝，报告标明未完成。"
+            "不保证平台账单。"
+            if (afford or {}).get("send_allowed")
+            else "最坏预留超过剩余预算，或输入上界不可用，拒绝发送。"
         ),
     }
     model = {
@@ -282,6 +284,102 @@ def execute_budget(
     return _budget_status(
         output, command="budget", symbol=None, model=model, limits=limits, extra=extra, research=research,
     )
+
+
+def _run_reserved_research(output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan) -> int:
+    """Run the multi-role graph only after the worst-case plan is reserved."""
+    from research_entry.budget import Ledger
+    from research_entry.budget_gate import install_chat_gate
+    from tradingagents.graph import trading_graph
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    ledger = Ledger(output / "budget-ledger.json", budget_cny, prior, card)
+    ledger.reserve(plan, "tencent-research")
+    original = trading_graph.create_tier_client
+
+    def gated(config, tier, **kwargs):
+        client = original(config, tier, **kwargs)
+        llm = install_chat_gate(
+            client.get_llm(),
+            ledger,
+            input_cap=int(plan["input_cap"]),
+            output_cap=int(plan["output_cap"]),
+            expected_model=plan["quick_model"] if tier == "quick" else plan["deep_model"],
+        )
+
+        def get_llm():
+            return llm
+
+        client.get_llm = get_llm
+        return client
+
+    trading_graph.create_tier_client = gated
+    model_out = dict(model)
+    try:
+        graph = TradingAgentsGraph(
+            selected_analysts=chosen,
+            debug=False,
+            config=_research_config(
+                output, "deepseek", plan["quick_model"], plan["deep_model"], None, limits,
+            ),
+        )
+        _state, decision = graph.propagate(mapped["canonical"], as_of, asset_type="stock", portfolio=None)
+    except BudgetRefusal as exc:
+        model_out["called"] = True
+        model_out["status"] = "research_incomplete"
+        model_out["reason"] = str(exc)
+        research = {
+            "status": "research_incomplete",
+            "end_to_end": False,
+            "decision": None,
+            "reason": str(exc),
+        }
+        code = 2
+    except Exception as exc:
+        model_out["called"] = True
+        model_out["status"] = "research_incomplete"
+        model_out["reason"] = f"{type(exc).__name__}: {exc}"
+        research = {
+            "status": "research_incomplete",
+            "end_to_end": False,
+            "decision": None,
+            "reason": model_out["reason"],
+        }
+        code = 1
+    else:
+        model_out["called"] = True
+        model_out["status"] = "research_attempted"
+        model_out["reason"] = "多角色流程已在预算闸门内跑完。截断或缺失必须看账本，不能把结果当成无保留的完整研判。"
+        research = {
+            "status": "research_attempted",
+            "end_to_end": False,
+            "decision": decision if isinstance(decision, str) else str(decision),
+            "reason": model_out["reason"],
+        }
+        code = 0
+    finally:
+        trading_graph.create_tier_client = original
+    snapshot = ledger.snapshot()
+    status = build_status(
+        command="run",
+        symbol=mapped,
+        model=model_out,
+        data=not_requested_data(as_of),
+        research=research,
+        limits=limits,
+        extra={
+            "assumptions": list(ASSUMPTIONS),
+            "research_plan": plan,
+            "ledger": snapshot,
+            "truncated_slots": [
+                slot for slot in snapshot.get("slots", []) if slot.get("truncated")
+            ],
+            "full_research_reliable_within_budget": False,
+            "worst_case_reserved_cny": plan["reserved_cny"],
+        },
+    )
+    write_status(output, status)
+    return code
 
 
 def _send_reserved_probe(ledger, probe: dict):
@@ -321,7 +419,7 @@ def _refuse_unbounded_research(
 ) -> int:
     """DeepSeek research is not sent until a complete ceiling is proven."""
     card = official_price_card()
-    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_probe_hold(card))
+    prior = prior_hold_cny if prior_hold_cny not in (None, "") else str(conservative_prior_reservation_hold(card))
     cap = int(input_token_cap or 8192)
     refusal = None
     plan = None
@@ -380,7 +478,15 @@ def _refuse_unbounded_research(
             )
             write_status(output, status)
             return 0
-        raise BudgetRefusal(plan["completion_blocker"])
+        if not afford["send_allowed"]:
+            detail = (
+                f"最坏预留 {plan['reserved_cny']} 元，剩余 {afford['remaining_cny']} 元。"
+                f"{plan['completion_blocker']}"
+            )
+            raise BudgetRefusal(detail)
+        return _run_reserved_research(
+            output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan, ledger_prior=prior,
+        )
     except BudgetRefusal as exc:
         refusal = str(exc)
     model = dict(model)

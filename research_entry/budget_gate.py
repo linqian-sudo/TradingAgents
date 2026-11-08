@@ -1,10 +1,17 @@
-"""Wrap the official chat client so an unreserved request cannot be sent."""
+"""Wrap every chat call so an unreserved request cannot be sent."""
 
 from __future__ import annotations
 
 import contextlib
+import threading
 
-from research_entry.budget import BudgetRefusal, Ledger
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.runnables import Runnable, RunnableLambda
+from pydantic import ConfigDict, Field
+
+from research_entry.budget import BudgetRefusal, Ledger, prepare_for_send, tool_schema
+
+_PERMIT = threading.local()
 
 _MARKER = "_budget_wrapped_create"
 
@@ -94,6 +101,35 @@ def _wrap_resource(resource, llm, ledger: Ledger) -> None:
                 setattr(resource, name, refuse)
 
 
+def guard_transport(llm) -> None:
+    """Reject a completion create that did not just pass through the chat ledger."""
+    client = getattr(llm, "client", None)
+    if client is None or not hasattr(client, "create"):
+        return
+    current = client.create
+    if getattr(current, "_budget_transport_guard", False):
+        return
+
+    def guarded(*args, **kwargs):
+        consume_transport_permit()
+        return current(*args, **kwargs)
+
+    guarded._budget_transport_guard = True
+    client.create = guarded
+
+
+def install_chat_gate(llm, ledger: Ledger, *, input_cap: int, output_cap: int, expected_model: str):
+    """Return the model the graph must use. Direct creates without a permit fail."""
+    guard_transport(llm)
+    return BudgetedChatModel(
+        inner=llm,
+        ledger=ledger,
+        input_cap=input_cap,
+        output_cap=output_cap,
+        expected_model=expected_model,
+    )
+
+
 def install_budget_gate(llm, ledger: Ledger):
     """Wrap sync and async chat completions. Raise before any other path is used."""
     _retries_closed(llm)
@@ -107,6 +143,125 @@ def install_budget_gate(llm, ledger: Ledger):
     llm._budget_gate_installed = True
     assert_controlled(llm)
     return llm
+
+
+def _open_permit() -> None:
+    _PERMIT.depth = getattr(_PERMIT, "depth", 0) + 1
+
+
+def _close_permit() -> None:
+    _PERMIT.depth = 0
+
+
+def consume_transport_permit() -> None:
+    """A raw HTTP create must sit inside a reservation made on this thread."""
+    depth = getattr(_PERMIT, "depth", 0)
+    if depth <= 0:
+        raise BudgetRefusal("传输层没有发送前预留，拒绝发送。")
+    _PERMIT.depth = depth - 1
+
+
+def _usage_from_result(result):
+    llm_output = getattr(result, "llm_output", None) or {}
+    usage = llm_output.get("token_usage") or llm_output.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+class _ChargedRunnable(Runnable):
+    """One structured or delegated invoke, charged before the inner call."""
+
+    def __init__(self, inner, ledger: Ledger, input_cap: int, output_cap: int, expected_model: str):
+        self.inner = inner
+        self.ledger = ledger
+        self.input_cap = input_cap
+        self.output_cap = output_cap
+        self.expected_model = expected_model
+
+    def invoke(self, input, config=None, **kwargs):
+        prepared, _bound, truncated = prepare_for_send(input, None, self.input_cap)
+        index = self.ledger.begin_send(
+            model=self.expected_model,
+            messages=prepared if isinstance(prepared, list) else [prepared],
+            tools=None,
+            max_tokens=self.output_cap,
+            thinking="disabled",
+            effort="none",
+            stream=False,
+            truncated=truncated,
+        )
+        _open_permit()
+        try:
+            if isinstance(self.inner, RunnableLambda):
+                result = self.inner.invoke(input, config, **kwargs)
+            else:
+                result = self.inner.invoke(prepared, config, **kwargs)
+        except Exception:
+            self.ledger.abort(index)
+            raise
+        else:
+            self.ledger.settle(index, _usage_from_result(result))
+            return result
+        finally:
+            _close_permit()
+
+
+class BudgetedChatModel(BaseChatModel):
+    """LangChain model whose every generate or structured call pays the ledger first."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    inner: object = Field(exclude=True)
+    ledger: object = Field(exclude=True)
+    input_cap: int
+    output_cap: int
+    expected_model: str
+    bound_tools: tuple = ()
+
+    @property
+    def _llm_type(self) -> str:
+        return "budgeted-chat"
+
+    def bind_tools(self, tools, **kwargs):
+        bound = self.inner.bind_tools(tools, **kwargs)
+        return BudgetedChatModel(
+            inner=bound,
+            ledger=self.ledger,
+            input_cap=self.input_cap,
+            output_cap=self.output_cap,
+            expected_model=self.expected_model,
+            bound_tools=tuple(tools),
+        )
+
+    def with_structured_output(self, schema, **kwargs):
+        bound = self.inner.with_structured_output(schema, **kwargs)
+        return _ChargedRunnable(bound, self.ledger, self.input_cap, self.output_cap, self.expected_model)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        prepared, _bound, truncated = prepare_for_send(messages, self.bound_tools, self.input_cap)
+        max_tokens = int(kwargs.get("max_tokens") or self.output_cap)
+        if max_tokens > self.output_cap:
+            raise BudgetRefusal(f"max_tokens {max_tokens} 超过输出上界 {self.output_cap}，拒绝发送。")
+        schema = tool_schema(self.bound_tools)
+        index = self.ledger.begin_send(
+            model=self.expected_model,
+            messages=prepared,
+            tools=schema,
+            max_tokens=max_tokens,
+            thinking="disabled",
+            effort="none",
+            stream=False,
+            truncated=truncated,
+        )
+        _open_permit()
+        try:
+            result = self.inner._generate(prepared, stop=stop, run_manager=run_manager, **kwargs)
+        except Exception:
+            self.ledger.abort(index)
+            raise
+        else:
+            self.ledger.settle(index, _usage_from_result(result))
+            return result
+        finally:
+            _close_permit()
 
 
 def assert_controlled(llm) -> None:

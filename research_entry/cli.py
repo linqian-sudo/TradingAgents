@@ -11,7 +11,13 @@ import os
 import sys
 from pathlib import Path
 
-from research_entry.budget import conservative_probe_hold
+from research_entry.budget import (
+    RESEARCH_ANALYSTS,
+    RESEARCH_INPUT_CAP,
+    RESEARCH_OUTPUT_CAP,
+    RESEARCH_TOOL_ROUNDS,
+    conservative_prior_reservation_hold,
+)
 from research_entry.limits import DEFAULT_LIMITS
 from research_entry.runner import (
     execute_budget,
@@ -77,15 +83,15 @@ def _build_parser() -> argparse.ArgumentParser:
     budget = sub.add_parser("budget", help="只核算预算，不构造模型客户端")
     budget.add_argument("--output", required=True)
     budget.add_argument("--quick-model", default="deepseek-flash")
-    budget.add_argument("--deep-model", default="deepseek-v4-pro")
-    budget.add_argument("--analysts", default="market")
-    budget.add_argument("--budget-cny", default="1")
+    budget.add_argument("--deep-model", default="deepseek-flash")
+    budget.add_argument("--analysts", default=",".join(RESEARCH_ANALYSTS))
+    budget.add_argument("--budget-cny", default="9.5")
     budget.add_argument("--prior-hold-cny", default=None)
-    budget.add_argument("--input-token-cap", type=int, default=8192)
+    budget.add_argument("--input-token-cap", type=int, default=RESEARCH_INPUT_CAP)
     budget.add_argument("--max-debate-rounds", type=int, default=DEFAULT_LIMITS["max_debate_rounds"])
     budget.add_argument("--max-risk-rounds", type=int, default=DEFAULT_LIMITS["max_risk_discuss_rounds"])
-    budget.add_argument("--max-tool-rounds", type=int, default=DEFAULT_LIMITS["max_tool_rounds"])
-    budget.add_argument("--max-tokens", type=int, default=DEFAULT_LIMITS["max_tokens"])
+    budget.add_argument("--max-tool-rounds", type=int, default=RESEARCH_TOOL_ROUNDS)
+    budget.add_argument("--max-tokens", type=int, default=RESEARCH_OUTPUT_CAP)
     budget.add_argument("--max-retries", type=int, default=0)
     return parser
 
@@ -144,7 +150,7 @@ def main(argv: list[str] | None = None) -> None:
                 quick_model=args.quick_model,
                 deep_model=args.deep_model,
                 budget_cny=args.budget_cny,
-                prior_hold_cny=args.prior_hold_cny or str(conservative_probe_hold()),
+                prior_hold_cny=args.prior_hold_cny or str(conservative_prior_reservation_hold()),
                 input_token_cap=args.input_token_cap,
                 backend_url=None,
             )

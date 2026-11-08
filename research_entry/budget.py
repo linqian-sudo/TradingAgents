@@ -31,9 +31,21 @@ TEMPLATE_OVERHEAD_TOKENS = 128
 CONTEXT_TOKEN_CEILING = 1_000_000
 OUTPUT_TOKEN_CEILING = 384 * 1024
 # The parent's basic call reported 7 prompt tokens and 2 completion tokens.
-# 0.000015 CNY is the off-peak cache-miss figure. Reservation uses peak.
+# Peak cache-miss usage of those counts is 0.000030 CNY. The call was not
+# made through this ledger, so the held amount is a 4096/32 reservation.
 PROBE_PROMPT_TOKENS = 7
 PROBE_COMPLETION_TOKENS = 2
+PRIOR_RESERVATION_INPUT_TOKENS = 4096
+PRIOR_RESERVATION_OUTPUT_TOKENS = 32
+# A full research reserves this measured ceiling per call, never the 1M window.
+RESEARCH_INPUT_CAP = 24_000
+RESEARCH_OUTPUT_CAP = 1024
+RESEARCH_TOOL_ROUNDS = 1
+RESEARCH_ANALYSTS = ("market", "news", "fundamentals")
+TRUNCATION_BANNER = (
+    "\n[已截断] 本段超过本次请求的输入上界。已保留开头的标识、记录数、区间和结尾的最近记录；"
+    "中间明细未送入模型。不得把这段写成完整原始数据。\n"
+)
 
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -168,8 +180,18 @@ def call_cost(card: PriceCard, model: str, input_tokens: int, output_tokens: int
 
 
 def conservative_probe_hold(card: PriceCard | None = None) -> Decimal:
-    """Peak cache-miss hold for the already reported 7/2 basic call."""
+    """Peak cache-miss price of the reported 7/2 usage. Not the ledger hold."""
     return call_cost(card or official_price_card(), "deepseek-flash", PROBE_PROMPT_TOKENS, PROBE_COMPLETION_TOKENS)
+
+
+def conservative_prior_reservation_hold(card: PriceCard | None = None) -> Decimal:
+    """Hold a 4096-input / 32-output reservation for the unbounded basic call."""
+    return call_cost(
+        card or official_price_card(),
+        "deepseek-flash",
+        PRIOR_RESERVATION_INPUT_TOKENS,
+        PRIOR_RESERVATION_OUTPUT_TOKENS,
+    )
 
 
 def text_token_upper_bound(text: str) -> int:
@@ -233,8 +255,125 @@ ASSUMPTIONS = (
     "思考模式必须显式关闭。官方没有写明推理 token 一定被 max_tokens 包含；不关闭则拒绝。输出上界就是这次请求里的 max_tokens。",
     "输入上界是载荷文本的 UTF-8 字节数，再加每条消息和每个工具 128 token 的模板余量。非文本内容拒绝。该字节上界依赖“一个 UTF-8 字节至多一个 token”。",
     "SDK 隐式重试必须为 0。计划外调用、usage 缺失都不退预留，也不再追加调用。",
-    "完整研究图会把工具结果再次送入模型。工具结果没有事先上界，因此不能保证完整研究在预算内结束。",
+    "完整研究按每次请求的输入上界和 max_tokens 预留，不按 100 万上下文预留。上界装不进剩余预算，或压缩后仍超过上界，就在发送前拒绝。",
+    "工具文本超限时保留开头标识和结尾最近记录，并写入截断声明。这不能把被截掉的明细说成已经分析过。",
+    "价格于 2026-11-08 再次核对官网，数字未变。价格卡仍在 2026-11-15 00:00 UTC 失效。失效后拒绝发送。",
 )
+
+
+def message_payload(messages) -> list:
+    """Plain messages whose text is exactly what the token bound measures."""
+    if isinstance(messages, str):
+        return [{"role": "user", "content": messages}]
+    rendered = []
+    for message in messages or []:
+        if isinstance(message, str):
+            rendered.append({"role": "user", "content": message})
+            continue
+        if isinstance(message, dict):
+            rendered.append(message)
+            continue
+        content = getattr(message, "content", "")
+        item = {"role": str(getattr(message, "type", "unknown")), "content": content}
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        rendered.append(item)
+    return rendered
+
+
+def tool_schema(tools) -> list | None:
+    if not tools:
+        return None
+    rendered = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            rendered.append(tool)
+            continue
+        rendered.append({
+            "name": str(getattr(tool, "name", "")),
+            "description": str(getattr(tool, "description", "") or ""),
+        })
+    return rendered
+
+
+def _clone_message(message):
+    if isinstance(message, (str, dict)):
+        return message if isinstance(message, str) else dict(message)
+    if hasattr(message, "model_copy"):
+        return message.model_copy()
+    raise BudgetRefusal(f"无法复制消息 {type(message).__name__}，拒绝发送。")
+
+
+def _content_of(message) -> str | None:
+    if isinstance(message, str):
+        return message
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    return content if isinstance(content, str) else None
+
+
+def _set_content(message, content: str):
+    if isinstance(message, dict):
+        message["content"] = content
+        return message
+    if hasattr(message, "content"):
+        message.content = content
+        return message
+    raise BudgetRefusal("消息内容不能改写，拒绝发送。")
+
+
+def _shrink_text(text: str, head_lines: int, tail_lines: int) -> str:
+    lines = text.splitlines(keepends=True)
+    if len(lines) > head_lines + tail_lines + 1:
+        body = "".join(lines[:head_lines]) + TRUNCATION_BANNER + "".join(lines[-tail_lines:])
+    else:
+        keep = max(200, len(text) // 2)
+        body = text[:keep] + TRUNCATION_BANNER + text[-keep:]
+    if TRUNCATION_BANNER not in body:
+        body = text[:200] + TRUNCATION_BANNER
+    return body
+
+
+def prepare_for_send(messages, tools, input_cap: int):
+    """Fit a request under ``input_cap`` or refuse before anything is sent.
+
+    Tool and dialogue text keeps its head and its latest lines. The returned
+    bound is the conservative token ceiling of the payload that would be sent.
+    """
+    if input_cap < 1:
+        raise BudgetRefusal("输入上界必须为正。")
+    if input_cap >= CONTEXT_TOKEN_CEILING:
+        raise BudgetRefusal("拒绝按 100 万上下文预留。请设置更小且可测量的输入上界。")
+    was_string = isinstance(messages, str)
+    cloned = [_clone_message(message) for message in ([messages] if was_string else list(messages or []))]
+    truncated = False
+    head, tail = 40, 12
+    for _ in range(24):
+        payload = message_payload(cloned)
+        schema = tool_schema(tools)
+        bound = request_token_upper_bound(payload, schema)
+        if bound <= input_cap:
+            sent = cloned[0] if was_string else cloned
+            return sent, bound, truncated
+        longest = None
+        longest_size = 0
+        for message in cloned:
+            content = _content_of(message)
+            if not content:
+                continue
+            size = text_token_upper_bound(content)
+            if size > longest_size:
+                longest = message
+                longest_size = size
+        if longest is None or longest_size < 400:
+            break
+        _set_content(longest, _shrink_text(_content_of(longest), head, tail))
+        truncated = True
+        head = max(8, head // 2)
+        tail = max(4, tail // 2)
+    raise BudgetRefusal(
+        f"保留关键事实后，请求输入上界仍超过 {input_cap} token，拒绝发送。"
+    )
 
 
 def research_call_counts(analysts: list[str], *, tool_rounds: int, debate_rounds: int, risk_rounds: int) -> dict:
@@ -303,20 +442,35 @@ def build_plan(
         total += call_cost(card, slot["model"], input_cap, output_cap)
     total = _money(total)
     unbounded_one = call_cost(card, quick_model, CONTEXT_TOKEN_CEILING, output_cap)
+    attempt_allowed = input_cap < CONTEXT_TOKEN_CEILING
+    blocker = (
+        "最坏费用按每次请求的输入上界和输出上限预留，不按 100 万上下文预留。"
+        "某次请求在保留关键事实后仍超过输入上界时，发送前拒绝，报告标明未完成。"
+        "不保证平台账单与本次一定跑完。"
+    )
+    if not attempt_allowed:
+        blocker = (
+            f"输入上界不能使用官方 100 万上下文。那样单次高峰未命中预留为 {unbounded_one} 元。"
+        )
     return {
         "kind": "research",
         "counts": counts,
+        "analysts": list(analysts),
+        "tool_rounds": tool_rounds,
+        "debate_rounds": debate_rounds,
+        "risk_rounds": risk_rounds,
+        "quick_model": quick_model,
+        "deep_model": deep_model,
         "input_cap": input_cap,
         "output_cap": output_cap,
         "retries": 0,
         "slots": len(slots),
         "reserved_cny": str(total),
+        "one_call_cny": str(call_cost(card, quick_model, input_cap, output_cap)),
         "one_unbounded_context_call_cny": str(unbounded_one),
+        "attempt_allowed": attempt_allowed,
         "completion_guaranteed": False,
-        "completion_blocker": (
-            "工具回传没有可证明的 token 上界。按上下文 100 万 token 预留时，"
-            f"单次请求高峰未命中价为 {unbounded_one} 元，完整研究不能保证在总预算内结束。"
-        ),
+        "completion_blocker": blocker,
     }
 
 
@@ -339,6 +493,7 @@ def build_probe_plan(
         "slots": 1,
         "retries": 0,
         "reserved_cny": str(amount),
+        "attempt_allowed": True,
         "completion_guaranteed": True,
         "completion_note": "这只是一次有上界的对话请求，不是多代理研究结论。",
     }
@@ -382,9 +537,36 @@ class Ledger:
         digest = hashlib.sha256(
             json.dumps(plan, ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
-        if plan.get("kind") != "probe":
-            raise BudgetRefusal("研究方案没有可证明的完整上界，拒绝预留后发送。")
-        reserved = call_cost(self.card, plan["model"], int(plan["input_cap"]), int(plan["output_cap"]))
+        if plan.get("kind") == "probe":
+            reserved = call_cost(self.card, plan["model"], int(plan["input_cap"]), int(plan["output_cap"]))
+            slot_rows = _slots(plan["model"], 1, int(plan["input_cap"]), int(plan["output_cap"]), "probe")
+        elif plan.get("kind") == "research":
+            if not plan.get("attempt_allowed"):
+                raise BudgetRefusal(plan.get("completion_blocker") or "研究方案不能发送。")
+            rebuilt = build_plan(
+                quick_model=plan["quick_model"],
+                deep_model=plan["deep_model"],
+                analysts=list(plan["analysts"]),
+                tool_rounds=int(plan["tool_rounds"]),
+                debate_rounds=int(plan["debate_rounds"]),
+                risk_rounds=int(plan["risk_rounds"]),
+                input_cap=int(plan["input_cap"]),
+                output_cap=int(plan["output_cap"]),
+                retries=0,
+                card=self.card,
+                now=now,
+            )
+            reserved = _parse_money(rebuilt["reserved_cny"])
+            slot_rows = _slots(
+                rebuilt["quick_model"], rebuilt["counts"]["quick"],
+                int(rebuilt["input_cap"]), int(rebuilt["output_cap"]), "quick",
+            )
+            slot_rows += _slots(
+                rebuilt["deep_model"], rebuilt["counts"]["deep"],
+                int(rebuilt["input_cap"]), int(rebuilt["output_cap"]), "deep",
+            )
+        else:
+            raise BudgetRefusal("未知预算方案，拒绝预留。")
         if _parse_money(plan["reserved_cny"]) < reserved:
             raise BudgetRefusal("方案声明的金额低于按价格卡重算的上界，拒绝预留。")
         with self._thread:
@@ -399,8 +581,6 @@ class Ledger:
                 raise BudgetRefusal(
                     f"预留 {reserved} 元加上先前占用 {self.prior_hold} 元，超过总预算 {self.budget} 元。"
                 )
-            if plan.get("kind") != "probe":
-                raise BudgetRefusal("研究方案没有可证明的完整上界，拒绝预留后发送。")
             state = {
                 "run_id": run_id,
                 "plan_digest": digest,
@@ -412,14 +592,13 @@ class Ledger:
                 "frozen": False,
                 "slots": [],
             }
-            count = int(plan["slots"])
-            state["slots"] = _slots(plan["model"], 1, plan["input_cap"], plan["output_cap"], "probe")
-            if len(state["slots"]) != count:
+            state["slots"] = slot_rows
+            if len(state["slots"]) != int(plan["slots"]):
                 raise BudgetRefusal("预留槽位数量与方案不一致。")
             self._write(state)
             return state
 
-    def begin_send(self, *, model: str, messages, tools=None, max_tokens: int, thinking: str, effort: str, stream: bool, card: PriceCard | None = None) -> int:
+    def begin_send(self, *, model: str, messages, tools=None, max_tokens: int, thinking: str, effort: str, stream: bool, card: PriceCard | None = None, truncated: bool = False) -> int:
         card = card or self.card
         if stream:
             raise BudgetRefusal("流式响应不能在发送前同时证明最终 usage，拒绝发送。")
@@ -430,7 +609,7 @@ class Ledger:
         if card.digest() != self._require_state()["card_digest"]:
             raise BudgetRefusal("价格卡与预留时不一致，拒绝发送。")
         require_fresh(card)
-        bound = request_token_upper_bound(messages, tools)
+        bound = request_token_upper_bound(message_payload(messages), tools)
         with self._thread:
             state = self._read()
             if state.get("frozen"):
@@ -451,6 +630,7 @@ class Ledger:
                 slot["status"] = "sending"
                 slot["input_bound"] = bound
                 slot["max_tokens"] = max_tokens
+                slot["truncated"] = bool(truncated)
                 chosen = index
                 break
             if chosen is None:
@@ -525,5 +705,5 @@ def assess_affordability(budget_cny: str, prior_hold_cny: str, plan: dict) -> di
         "remaining_cny": str(remaining),
         "reserved_cny": str(reserved),
         "fits_reservation": fits,
-        "send_allowed": bool(fits and plan.get("completion_guaranteed")),
+        "send_allowed": bool(fits and plan.get("attempt_allowed")),
     }
