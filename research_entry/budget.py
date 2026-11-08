@@ -562,7 +562,10 @@ class Ledger:
 
     def _write(self, payload: dict) -> None:
         temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, self.path)
 
     def reserve(self, plan: dict, run_id: str, *, now: datetime | None = None) -> dict:
@@ -783,6 +786,8 @@ class Ledger:
         path = self.path.with_name("budget-journal.jsonl")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _require_state(self) -> dict:
         state = self._read()
@@ -793,6 +798,125 @@ class Ledger:
     def snapshot(self) -> dict:
         with self._thread:
             return self._read()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _plain(amount: Decimal) -> str:
+    text = format(_money(amount), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def conservative_occupation(state: dict) -> Decimal:
+    """Full hold of a finished ledger: its prior plus its whole plan reservation.
+
+    Known usage is already inside that reservation. Unknown slots are too.
+    Neither is added again.
+    """
+    return _parse_money(state["prior_hold_cny"]) + _parse_money(state["reserved_cny"])
+
+
+def known_settled_usage(state: dict) -> Decimal:
+    total = Decimal("0")
+    for slot in state.get("slots") or []:
+        if slot.get("status") == "settled" and slot.get("charged_cny") not in (None, ""):
+            total += _parse_money(slot["charged_cny"])
+    return _money(total)
+
+
+def inherit_frozen_ledger(
+    old_path: Path,
+    *,
+    new_ledger_path: Path,
+    budget_cny: str,
+    new_reserved_cny: str,
+    stated_prior: str | None = None,
+) -> dict:
+    """Read a frozen ledger and inherit its full conservative hold.
+
+    Does not unfreeze, delete, or rewrite the old ledger or any lock file.
+    A new run may reserve only in a different file, and only when
+    inherited hold plus the new plan still fit the same total budget.
+    """
+    old_path = Path(old_path).resolve()
+    new_ledger_path = Path(new_ledger_path).resolve()
+    if old_path == new_ledger_path:
+        raise BudgetRefusal("新账本不能写在已冻结的旧账本上，也不能把旧账本改成未冻结。")
+    if not old_path.is_file():
+        raise BudgetRefusal(f"找不到旧账本 {old_path}，拒绝续测。")
+    before = sha256_file(old_path)
+    raw = old_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != before:
+        raise BudgetRefusal("读取旧账本时内容变化，拒绝续测。")
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BudgetRefusal("旧账本不是可读的 JSON，拒绝续测。") from exc
+    if not isinstance(state, dict) or not state.get("run_id"):
+        raise BudgetRefusal("旧账本没有已入账的运行，拒绝续测。")
+    if state.get("frozen") is not True:
+        raise BudgetRefusal(
+            "旧账本未冻结。不能另开一本并行发送，也不能为了续测去改写它。"
+        )
+    occupation = _money(conservative_occupation(state))
+    known = known_settled_usage(state)
+    if stated_prior not in (None, ""):
+        stated = _parse_money(stated_prior)
+        if stated != occupation:
+            raise BudgetRefusal(
+                f"声明的 prior {stated} 与旧账本保守占用 {occupation} 不一致。"
+                "不能少算整计划预留，也不能改成另一个数。"
+            )
+    budget = _parse_money(budget_cny)
+    reserved = _parse_money(new_reserved_cny)
+    cumulative = _money(occupation + reserved)
+    if occupation + reserved > budget:
+        raise BudgetRefusal(
+            f"继承占用 {occupation} 元加上新预留 {reserved} 元，超过总预算 {budget} 元。"
+        )
+    lock_files = []
+    for candidate in sorted(old_path.parent.iterdir()):
+        if not candidate.is_file() or candidate.resolve() == old_path:
+            continue
+        if "lock" not in candidate.name.lower():
+            continue
+        lock_files.append({
+            "name": candidate.name,
+            "sha256": sha256_file(candidate),
+            "bytes": candidate.stat().st_size,
+        })
+    if sha256_file(old_path) != before or old_path.read_bytes() != raw:
+        raise BudgetRefusal("确认继承时旧账本已被改写，拒绝续测。")
+    return {
+        "acknowledgment": "旧账本保持冻结。未删除、未改写、未释放 unknown。新账本只继承整笔保守占用。",
+        "old_ledger_path": str(old_path),
+        "old_ledger_sha256": before,
+        "old_ledger_bytes": len(raw),
+        "old_frozen": True,
+        "old_freeze_reason": state.get("freeze_reason"),
+        "old_run_id": state.get("run_id"),
+        "old_budget_cny": state.get("budget_cny"),
+        "old_prior_hold_cny": _plain(_parse_money(state["prior_hold_cny"])),
+        "old_reserved_cny": _plain(_parse_money(state["reserved_cny"])),
+        "known_usage_cny_not_added": _plain(known),
+        "unknown_released": False,
+        "old_file_modified": False,
+        "lock_files": lock_files,
+        "lock_note": "进程内锁不是文件。目录中名字含 lock 的文件只记录哈希，不打开写入。",
+        "inherited_hold_cny": _plain(occupation),
+        "new_reserved_cny": _plain(reserved),
+        "cumulative_conservative_cny": _plain(cumulative),
+        "budget_cny": _plain(budget),
+        "fits_budget": True,
+    }
 
 
 def assess_affordability(budget_cny: str, prior_hold_cny: str, plan: dict) -> dict:

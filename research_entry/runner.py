@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import os
+import signal
+import time
+from datetime import datetime
 from pathlib import Path
 
 from research_entry.budget import (
@@ -20,6 +23,12 @@ from research_entry.data_check import check_history
 from research_entry.limits import parse_analysts, resolve_limits
 from research_entry.mapping import map_symbol
 from research_entry.model_gate import assess_model, credential_catalog
+from research_entry.persist import (
+    atomic_write,
+    install_source_log,
+    source_summary,
+    write_role_files,
+)
 from research_entry.provenance import REFERENCE_SYMBOLS
 from research_entry.status_report import build_status, not_requested_data, write_status
 
@@ -286,8 +295,28 @@ def execute_budget(
     )
 
 
+def _stream_with_checkpoints(graph, output, symbol, as_of, flush) -> tuple:
+    """Yield each graph state to disk. A later kill keeps the last fsynced step."""
+    from tradingagents.agents.rating import run_rating
+
+    init = graph.create_run_state(symbol, as_of, asset_type="stock", portfolio=None)
+    args = graph.propagator.get_graph_args()
+    final = None
+    with graph.checkpoint_scope(symbol, as_of, "stock", None):
+        for chunk in graph.graph.stream(init, **args):
+            final = chunk
+            if isinstance(chunk, dict):
+                write_role_files(output / "roles", chunk)
+            flush("graph")
+    if not isinstance(final, dict):
+        raise RuntimeError("图没有产出可保存的状态")
+    graph.record_decision(symbol, as_of, final)
+    return final, run_rating(final)
+
+
 def _run_reserved_research(
     output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan, ledger_prior=None,
+    inheritance=None,
 ) -> int:
     """Run the multi-role graph only after the worst-case plan is reserved.
 
@@ -307,7 +336,17 @@ def _run_reserved_research(
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     ledger = Ledger(output / "budget-ledger.json", budget_cny, prior, card)
+    ledger.checkpoint_output = output
     ledger.reserve(plan, "tencent-research")
+    if inheritance is not None:
+        snapshot = ledger.snapshot()
+        snapshot["inheritance"] = {
+            "old_ledger_sha256": inheritance["old_ledger_sha256"],
+            "inherited_hold_cny": inheritance["inherited_hold_cny"],
+            "unknown_released": False,
+            "old_file_modified": False,
+        }
+        ledger._write(snapshot)
     original = trading_graph.create_tier_client
 
     def gated(config, tier, **kwargs):
@@ -330,20 +369,54 @@ def _run_reserved_research(
     from tradingagents.dataflows import router as data_router
     original_route = data_router.route_to_vendor
     source_log = output / "data-sources.jsonl"
-
-    def _record_source(method, *args, **kwargs):
-        row = {
-            "fetched_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "method": method,
-            "source": "tradingagents.dataflows.router",
-        }
-        with source_log.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        return original_route(method, *args, **kwargs)
-
-    data_router.route_to_vendor = _record_source
+    logged_route = install_source_log(source_log, original_route)
+    data_router.route_to_vendor = logged_route
+    import tradingagents.agents.tools as agent_tools
+    original_tool_route = agent_tools.route_to_vendor
+    agent_tools.route_to_vendor = logged_route
     model_out = dict(model)
     state = None
+    decision = None
+    interrupted = None
+
+    def _flush_checkpoint(phase: str) -> None:
+        partial = {
+            "phase": phase,
+            "ledger_frozen": bool(ledger.snapshot().get("frozen")),
+            "data_sources": source_summary(source_log),
+            "sigkill_note": "SIGKILL 不会进入这个函数。已 fsync 的 checkpoint 和 journal 会留下，终态 status 不保证写成。",
+        }
+        atomic_write(
+            output / "checkpoint" / "latest.json",
+            json.dumps(partial, ensure_ascii=False, indent=2) + "\n",
+        )
+        # Test seam only. Unset in normal runs. Sleeps on the main thread so
+        # SIGTERM can be observed after a checkpoint is already on disk.
+        pause_file = os.environ.get("TRADINGAGENTS_TEST_PAUSE_FILE")
+        if (
+            pause_file
+            and phase == "graph"
+            and (output / "checkpoint" / "responses.jsonl").exists()
+        ):
+            ready = Path(pause_file)
+            ready.parent.mkdir(parents=True, exist_ok=True)
+            ready.write_text("ready\n", encoding="utf-8")
+            fd = os.open(ready, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            time.sleep(60)
+
+    def _on_signal(signum, _frame):
+        name = signal.Signals(signum).name
+        atomic_write(output / "checkpoint" / "interrupt-requested", name + "\n")
+        raise KeyboardInterrupt(name)
+
+    previous_handlers = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous_handlers[signum] = signal.signal(signum, _on_signal)
+    _flush_checkpoint("reserved")
     try:
         graph = TradingAgentsGraph(
             selected_analysts=chosen,
@@ -352,7 +425,20 @@ def _run_reserved_research(
                 output, "deepseek", plan["quick_model"], plan["deep_model"], None, limits,
             ),
         )
-        state, decision = graph.propagate(mapped["canonical"], as_of, asset_type="stock", portfolio=None)
+        state, decision = _stream_with_checkpoints(graph, output, mapped["canonical"], as_of, _flush_checkpoint)
+    except KeyboardInterrupt as exc:
+        interrupted = str(exc) or "interrupt"
+        model_out["called"] = True
+        model_out["status"] = "research_interrupted"
+        model_out["reason"] = f"收到 {interrupted}。已保存当时的账本、角色文本和数据来源记录。"
+        research = {
+            "status": "research_interrupted",
+            "end_to_end": False,
+            "decision": None,
+            "reason": model_out["reason"],
+        }
+        code = 3
+        ledger.freeze_interrupted()
     except BudgetRefusal as exc:
         model_out["called"] = True
         model_out["status"] = "research_incomplete"
@@ -375,6 +461,7 @@ def _run_reserved_research(
             "reason": model_out["reason"],
         }
         code = 1
+        ledger.freeze_interrupted()
     else:
         model_out["called"] = True
         model_out["status"] = "research_attempted"
@@ -389,6 +476,12 @@ def _run_reserved_research(
     finally:
         trading_graph.create_tier_client = original
         data_router.route_to_vendor = original_route
+        agent_tools.route_to_vendor = original_tool_route
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+    if state:
+        write_role_files(output / "roles", state)
+    _flush_checkpoint("finished" if interrupted is None else "interrupted")
     snapshot = ledger.snapshot()
     defects = []
     for slot in snapshot.get("slots") or []:
@@ -425,6 +518,11 @@ def _run_reserved_research(
             ],
             "full_research_reliable_within_budget": False,
             "worst_case_reserved_cny": plan["reserved_cny"],
+            "inheritance": inheritance,
+            "data_sources": source_summary(source_log),
+            "partial_roles": sorted(path.stem for path in (output / "roles").glob("*.md")) if (output / "roles").exists() else [],
+            "checkpoint_dir": "checkpoint",
+            "sigkill_note": "SIGKILL 不能保证写出终态 status。已 fsync 的 checkpoint、journal 和角色文件会留下。",
         },
     )
     write_status(output, status)
@@ -465,6 +563,7 @@ def _refuse_unbounded_research(
     input_token_cap: int | None,
     backend_url: str | None,
     budget_mode: str,
+    inherit_frozen_ledger_path: str | None = None,
 ) -> int:
     """DeepSeek research is not sent until a complete ceiling is proven."""
     card = official_price_card()
@@ -496,6 +595,23 @@ def _refuse_unbounded_research(
             card=card,
         )
         probe = build_probe_plan(card=card)
+        inheritance = None
+        if inherit_frozen_ledger_path:
+            from research_entry.budget import inherit_frozen_ledger
+            from research_entry.persist import atomic_write
+
+            inheritance = inherit_frozen_ledger(
+                Path(inherit_frozen_ledger_path),
+                new_ledger_path=output / "budget-ledger.json",
+                budget_cny=budget_cny,
+                new_reserved_cny=plan["reserved_cny"] if budget_mode != "probe" else probe["reserved_cny"],
+                stated_prior=prior_hold_cny,
+            )
+            prior = inheritance["inherited_hold_cny"]
+            atomic_write(
+                output / "inheritance-manifest.json",
+                json.dumps(inheritance, ensure_ascii=False, indent=2) + "\n",
+            )
         afford = assess_affordability(budget_cny, prior, plan)
         probe_afford = assess_affordability(budget_cny, prior, probe)
         if budget_mode == "probe":
@@ -534,7 +650,8 @@ def _refuse_unbounded_research(
             )
             raise BudgetRefusal(detail)
         return _run_reserved_research(
-            output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan, ledger_prior=prior,
+            output, mapped, model, limits, chosen, as_of, card, budget_cny, prior, plan,
+            ledger_prior=prior, inheritance=inheritance,
         )
     except BudgetRefusal as exc:
         refusal = str(exc)
@@ -615,6 +732,7 @@ def execute_run(
     prior_hold_cny: str | None = None,
     input_token_cap: int | None = None,
     budget_mode: str = "research",
+    inherit_frozen_ledger_path: str | None = None,
 ) -> int:
     as_of = _parse_date(as_of)
     mapped = map_symbol(symbol, market)
@@ -673,6 +791,7 @@ def execute_run(
             input_token_cap=input_token_cap,
             backend_url=backend_url,
             budget_mode=budget_mode,
+            inherit_frozen_ledger_path=inherit_frozen_ledger_path,
         )
 
     # Imported only after the gate, so a missing key never constructs a client.

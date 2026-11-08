@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 from typing import ClassVar
 
@@ -237,19 +238,32 @@ class _ChargedRunnable(Runnable):
 
 def _mark_finish(ledger: Ledger, index: int, result) -> None:
     generations = getattr(result, "generations", None) or []
-    if not generations:
-        return
-    info = getattr(generations[0], "generation_info", None) or {}
-    message = getattr(generations[0], "message", None)
-    finish = info.get("finish_reason")
-    if finish is None and message is not None:
-        finish = (getattr(message, "response_metadata", None) or {}).get("finish_reason")
-    ledger.note_finish(index, finish)
+    message = None
+    finish = None
+    text = None
+    if generations:
+        info = getattr(generations[0], "generation_info", None) or {}
+        message = getattr(generations[0], "message", None)
+        finish = info.get("finish_reason")
+        if finish is None and message is not None:
+            finish = (getattr(message, "response_metadata", None) or {}).get("finish_reason")
+        if message is not None and isinstance(getattr(message, "content", None), str):
+            text = message.content
+    elif result is not None:
+        dumped = getattr(result, "model_dump", None)
+        text = json.dumps(dumped(), ensure_ascii=False) if callable(dumped) else str(result)
+    if finish is not None or text is not None:
+        ledger.note_finish(index, finish)
     if finish == "length" and message is not None and isinstance(getattr(message, "content", None), str):
         message.content += (
             "\n[输出已截断] finish_reason=length，已达到本次 max_tokens。"
             "这不是完整分析。\n"
         )
+        text = message.content
+    output = getattr(ledger, "checkpoint_output", None)
+    if output is not None and text is not None:
+        from research_entry.persist import write_response_checkpoint
+        write_response_checkpoint(output, index, text, finish)
 
 
 class BudgetedChatModel(BaseChatModel):

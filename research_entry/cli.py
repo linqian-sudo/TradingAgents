@@ -76,7 +76,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=DEFAULT_LIMITS["request_timeout"])
     run.add_argument("--max-retries", type=int, default=DEFAULT_LIMITS["llm_max_retries"])
     run.add_argument("--budget-cny", help="本次总预算，人民币，十进制字符串")
-    run.add_argument("--prior-hold-cny", help="先前占用。默认按基础探测的高峰未命中预留")
+    run.add_argument("--prior-hold-cny", help="先前占用。续测时由 --inherit-frozen-ledger 计算，不要手写一个更小的数")
+    run.add_argument(
+        "--inherit-frozen-ledger",
+        help="已冻结旧账本的路径。只读继承整笔保守占用，不解除冻结、不删除、不释放 unknown",
+    )
     run.add_argument("--input-token-cap", type=int, default=8192)
     run.add_argument("--budget-mode", choices=("research", "probe"), default="research")
 
@@ -132,6 +136,9 @@ def main(argv: list[str] | None = None) -> None:
                 environ=dict(os.environ),
                 budget_cny=args.budget_cny or os.environ.get("TRADINGAGENTS_BUDGET_CNY"),
                 prior_hold_cny=args.prior_hold_cny or os.environ.get("TRADINGAGENTS_PRIOR_HOLD_CNY"),
+                inherit_frozen_ledger_path=(
+                    args.inherit_frozen_ledger or os.environ.get("TRADINGAGENTS_INHERIT_FROZEN_LEDGER")
+                ),
                 input_token_cap=args.input_token_cap,
                 budget_mode=args.budget_mode,
             )
