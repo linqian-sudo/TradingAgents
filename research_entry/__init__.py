@@ -7,4 +7,4 @@ credentials stops before any model client is constructed.
 
 __all__ = ["__version__"]
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"

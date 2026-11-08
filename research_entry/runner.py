@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from research_entry.budget import (
@@ -327,7 +327,23 @@ def _run_reserved_research(
         return client
 
     trading_graph.create_tier_client = gated
+    from tradingagents.dataflows import router as data_router
+    original_route = data_router.route_to_vendor
+    source_log = output / "data-sources.jsonl"
+
+    def _record_source(method, *args, **kwargs):
+        row = {
+            "fetched_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "method": method,
+            "source": "tradingagents.dataflows.router",
+        }
+        with source_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return original_route(method, *args, **kwargs)
+
+    data_router.route_to_vendor = _record_source
     model_out = dict(model)
+    state = None
     try:
         graph = TradingAgentsGraph(
             selected_analysts=chosen,
@@ -336,7 +352,7 @@ def _run_reserved_research(
                 output, "deepseek", plan["quick_model"], plan["deep_model"], None, limits,
             ),
         )
-        _state, decision = graph.propagate(mapped["canonical"], as_of, asset_type="stock", portfolio=None)
+        state, decision = graph.propagate(mapped["canonical"], as_of, asset_type="stock", portfolio=None)
     except BudgetRefusal as exc:
         model_out["called"] = True
         model_out["status"] = "research_incomplete"
@@ -372,7 +388,27 @@ def _run_reserved_research(
         code = 0
     finally:
         trading_graph.create_tier_client = original
+        data_router.route_to_vendor = original_route
     snapshot = ledger.snapshot()
+    defects = []
+    for slot in snapshot.get("slots") or []:
+        if slot.get("status") in {"usage_missing", "overrun", "sending"}:
+            defects.append(slot["status"])
+        if slot.get("truncated") or slot.get("output_truncated") or slot.get("finish_reason") == "length":
+            defects.append("truncated")
+    if defects and code == 0:
+        research["status"] = "research_incomplete"
+        research["end_to_end"] = False
+        research["decision"] = None
+        research["reason"] = "存在截断、usage 缺失或超限。原始角色文本已保留，但不能当作完整研判。"
+        model_out["status"] = "research_incomplete"
+        code = 2
+    if state:
+        role_dir = output / "roles"
+        role_dir.mkdir(parents=True, exist_ok=True)
+        for key, value in state.items():
+            if isinstance(value, str) and value.strip():
+                (role_dir / f"{key}.md").write_text(value, encoding="utf-8")
     status = build_status(
         command="run",
         symbol=mapped,

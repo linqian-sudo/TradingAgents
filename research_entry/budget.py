@@ -39,7 +39,7 @@ PRIOR_RESERVATION_INPUT_TOKENS = 4096
 PRIOR_RESERVATION_OUTPUT_TOKENS = 32
 # A full research reserves this measured ceiling per call, never the 1M window.
 RESEARCH_INPUT_CAP = 24_000
-RESEARCH_OUTPUT_CAP = 1024
+RESEARCH_OUTPUT_CAP = 4096
 RESEARCH_TOOL_ROUNDS = 1
 RESEARCH_ANALYSTS = ("market", "news", "fundamentals")
 TRUNCATION_BANNER = (
@@ -256,7 +256,7 @@ ASSUMPTIONS = (
     "completion_tokens 按单次响应记账，不把多次相加后再当成一次。reasoning_tokens 只作明细，不重复加到 completion_tokens 上。",
     "请求发出后如果供应商返回的 completion_tokens 仍大于 max_tokens，费用无法撤回。账本会冻结并停止后续请求。这不是对 9.5 元账单的绝对保证。",
     "输入上界是载荷文本的 UTF-8 字节数，再加每条消息和每个工具 128 token 的模板余量。非文本内容拒绝。该字节上界依赖“一个 UTF-8 字节至多一个 token”。",
-    "SDK 隐式重试必须为 0。计划外调用、usage 缺失都不退预留，也不再追加调用。",
+    "SDK 重试必须为 0。结构化解析失败不再自动改发自由文本。usage 缺失或进程中断留下的 sending 会立刻冻结全部后续请求，未知费用按该槽上界保留，不能记为 0。",
     "完整研究按每次请求的输入上界和 max_tokens 预留，不按 100 万上下文预留。上界装不进剩余预算，或压缩后仍超过上界，就在发送前拒绝。",
     "工具文本超限时保留开头标识和结尾最近记录，并写入截断声明。这不能把被截掉的明细说成已经分析过。",
     "价格于 2026-11-08 再次核对官网，数字未变。价格卡仍在 2026-11-15 00:00 UTC 失效。失效后拒绝发送。",
@@ -418,14 +418,14 @@ def research_call_counts(analysts: list[str], *, tool_rounds: int, debate_rounds
             raise BudgetRefusal(f"分析员 {name} 不在可预留的调用清单里。")
         quick += tool_rounds + 1
     quick += 2 * debate_rounds
-    quick += 2  # trader structured call plus free-text fallback
+    quick += 1  # trader, one structured call; no free-text retry
     quick += 3 * risk_rounds
-    deep = 2 + 2  # research manager and portfolio manager, each with fallback
+    deep = 2  # research manager and portfolio manager, one call each
     return {
         "quick": quick,
         "deep": deep,
         "reflections": 0,
-        "note": "记忆日志必须为空。已有待结算决策会再调用模型，本清单不包含，因此拒绝带历史记忆的运行。",
+        "note": "没有应用层自由文本重试。记忆日志必须为空，已有待结算决策不在本清单内。",
     }
 
 
@@ -553,6 +553,7 @@ class Ledger:
             raise BudgetRefusal("先前占用已经超过总预算。")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread = _lock_for(self.path)
+        self.freeze_interrupted()
 
     def _read(self) -> dict:
         if not self.path.exists() or self.path.stat().st_size == 0:
@@ -668,36 +669,62 @@ class Ledger:
             if chosen is None:
                 raise BudgetRefusal("没有剩余的预留槽位，拒绝计划外或重复发送。")
             self._write(state)
+            self._journal({
+                "event": "send",
+                "slot": chosen,
+                "model": model,
+                "input_bound": bound,
+                "max_tokens": max_tokens,
+                "truncated": bool(truncated),
+            })
             return chosen
 
-    def abort(self, slot_index: int) -> None:
-        """The request was not proven successful. Keep the reservation."""
+    def _unknown_charge(self, state: dict, slot: dict, reason: str) -> None:
+        slot["status"] = "usage_missing"
+        slot["charged_cny"] = str(call_cost(
+            self.card, slot["model"], slot["input_cap"], slot["output_cap"],
+        ))
+        slot["freeze_reason"] = reason
+        state["frozen"] = True
+        state["freeze_reason"] = reason
+
+    def abort(self, slot_index: int, *, sent: bool = True) -> None:
+        """A send that did not yield usage freezes the ledger. An unsent refusal does not."""
         with self._thread:
             state = self._read()
             slot = state["slots"][slot_index]
-            if slot["status"] == "sending":
-                slot["status"] = "usage_missing"
-                slot["charged_cny"] = str(call_cost(
-                    self.card, slot["model"], slot["input_cap"], slot["output_cap"],
-                ))
+            if slot["status"] != "sending":
+                self._write(state)
+                return
+            if sent:
+                self._unknown_charge(state, slot, "usage_missing")
+            else:
+                slot["status"] = "reserved"
+                slot.pop("input_bound", None)
+                slot.pop("max_tokens", None)
             self._write(state)
+            self._journal({"event": "abort", "slot": slot_index, "sent": sent, "frozen": state.get("frozen")})
 
-    def settle(self, slot_index: int, usage: dict | None) -> None:
+    def settle(self, slot_index: int, usage: dict | None, *, sent: bool = True) -> None:
         with self._thread:
             state = self._read()
             slot = state["slots"][slot_index]
             reserved = call_cost(self.card, slot["model"], slot["input_cap"], slot["output_cap"])
             if not usage or "prompt_tokens" not in usage or "completion_tokens" not in usage:
-                slot["status"] = "usage_missing"
-                slot["charged_cny"] = str(reserved)
+                if sent:
+                    self._unknown_charge(state, slot, "usage_missing")
+                else:
+                    slot["status"] = "local_no_provider_usage"
+                    slot["charged_cny"] = str(reserved)
                 self._write(state)
+                self._journal({"event": "usage_missing" if sent else "local_no_usage", "slot": slot_index})
                 return
             prompt = int(usage["prompt_tokens"])
             completion = int(usage["completion_tokens"])
             if prompt < 0 or completion < 0:
-                slot["status"] = "usage_missing"
-                slot["charged_cny"] = str(reserved)
+                self._unknown_charge(state, slot, "usage_missing")
                 self._write(state)
+                self._journal({"event": "usage_missing", "slot": slot_index})
                 return
             details = usage.get("completion_tokens_details") or {}
             reasoning = details.get("reasoning_tokens")
@@ -719,7 +746,43 @@ class Ledger:
                 slot["status"] = "settled"
                 slot["charged_cny"] = str(actual)
                 slot["released_for_more_calls"] = False
+            if slot.get("finish_reason") == "length":
+                state["output_truncated"] = True
             self._write(state)
+            self._journal({"event": "settle", "slot": slot_index, "status": slot["status"], "usage": slot.get("usage")})
+
+    def note_finish(self, slot_index: int, finish_reason: str | None) -> None:
+        with self._thread:
+            state = self._read()
+            slot = state["slots"][slot_index]
+            slot["finish_reason"] = finish_reason
+            if finish_reason == "length":
+                slot["output_truncated"] = True
+                state["output_truncated"] = True
+            self._write(state)
+
+    def freeze_interrupted(self) -> dict:
+        """A slot left in ``sending`` means the process died after checkout."""
+        with self._thread:
+            state = self._read()
+            if not state:
+                return {}
+            changed = False
+            for index, slot in enumerate(state.get("slots") or []):
+                if slot.get("status") == "sending":
+                    self._unknown_charge(state, slot, "interrupted_sending")
+                    slot["interrupted"] = True
+                    changed = True
+                    self._journal({"event": "interrupted", "slot": index})
+            if changed:
+                self._write(state)
+            return state
+
+    def _journal(self, event: dict) -> None:
+        event = {"at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), **event}
+        path = self.path.with_name("budget-journal.jsonl")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _require_state(self) -> dict:
         state = self._read()

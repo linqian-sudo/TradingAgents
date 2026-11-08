@@ -225,7 +225,8 @@ def test_resume_does_not_charge_twice_and_does_not_resend(tmp_path):
             effort="none",
             stream=False,
         )
-    assert reloaded.snapshot()["slots"][index]["status"] == "sending"
+    assert reloaded.snapshot()["frozen"] is True
+    assert reloaded.snapshot()["slots"][index]["status"] == "usage_missing"
 
 
 @pytest.mark.unit

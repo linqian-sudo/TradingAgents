@@ -74,10 +74,19 @@ def invoke_structured(structured_llm: Any | None, prompt: Any, agent_name: str) 
             raise ValueError("structured output returned no parsed result")
         return result
     except Exception as exc:
-        logger.warning(
-            "%s: structured-output invocation failed (%s); retrying once as free text",
-            agent_name, exc,
-        )
+        if type(exc).__name__ == "BudgetRefusal":
+            raise
+        budgeted = getattr(structured_llm, "budget_controlled", False) is True
+        if budgeted:
+            logger.warning(
+                "%s: structured-output invocation failed (%s); budget run will not send a free-text retry",
+                agent_name, exc,
+            )
+        else:
+            logger.warning(
+                "%s: structured-output invocation failed (%s); retrying once as free text",
+                agent_name, exc,
+            )
         return None
 
 
@@ -92,4 +101,11 @@ def invoke_structured_or_freetext(
     result = invoke_structured(structured_llm, prompt, agent_name)
     if result is not None:
         return render(result)
+    budgeted = any(getattr(candidate, "budget_controlled", False) is True for candidate in (structured_llm, plain_llm))
+    if budgeted:
+        return (
+            f"[{agent_name} 未完成] 结构化输出失败。"
+            "预算运行禁止自动自由文本重试，因此没有第二次模型请求。"
+            "本角色报告不完整。"
+        )
     return plain_llm.invoke(prompt).content

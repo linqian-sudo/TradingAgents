@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from typing import ClassVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableLambda
@@ -133,6 +134,7 @@ def guard_transport(llm, output_cap: int) -> None:
             raise BudgetRefusal("位置参数调用无法核对输出上限，拒绝发送。")
         pinned = pin_deepseek_request(kwargs, output_cap)
         consume_transport_permit()
+        _PERMIT.http_attempted = True
         return current(**pinned)
 
     guarded._budget_transport_guard = True
@@ -192,6 +194,8 @@ def _usage_from_result(result):
 class _ChargedRunnable(Runnable):
     """One structured or delegated invoke, charged before the inner call."""
 
+    budget_controlled = True
+
     def __init__(self, inner, ledger: Ledger, input_cap: int, output_cap: int, expected_model: str):
         self.inner = inner
         self.ledger = ledger
@@ -211,25 +215,47 @@ class _ChargedRunnable(Runnable):
             stream=False,
             truncated=truncated,
         )
+        _PERMIT.http_attempted = False
         _open_permit()
         try:
             if isinstance(self.inner, RunnableLambda):
                 result = self.inner.invoke(input, config, **kwargs)
             else:
-                result = self.inner.invoke(prepared, config, **kwargs)
+                result = self.inner.invoke(prepared, config, max_tokens=self.output_cap, **kwargs)
         except Exception:
-            self.ledger.abort(index)
+            self.ledger.abort(index, sent=bool(getattr(_PERMIT, "http_attempted", False)))
             raise
         else:
-            self.ledger.settle(index, _usage_from_result(result))
+            self.ledger.settle(
+                index, _usage_from_result(result), sent=bool(getattr(_PERMIT, "http_attempted", False)),
+            )
+            _mark_finish(self.ledger, index, result)
             return result
         finally:
             _close_permit()
 
 
+def _mark_finish(ledger: Ledger, index: int, result) -> None:
+    generations = getattr(result, "generations", None) or []
+    if not generations:
+        return
+    info = getattr(generations[0], "generation_info", None) or {}
+    message = getattr(generations[0], "message", None)
+    finish = info.get("finish_reason")
+    if finish is None and message is not None:
+        finish = (getattr(message, "response_metadata", None) or {}).get("finish_reason")
+    ledger.note_finish(index, finish)
+    if finish == "length" and message is not None and isinstance(getattr(message, "content", None), str):
+        message.content += (
+            "\n[输出已截断] finish_reason=length，已达到本次 max_tokens。"
+            "这不是完整分析。\n"
+        )
+
+
 class BudgetedChatModel(BaseChatModel):
     """LangChain model whose every generate or structured call pays the ledger first."""
 
+    budget_controlled: ClassVar[bool] = True
     model_config = ConfigDict(arbitrary_types_allowed=True)
     inner: object = Field(exclude=True)
     ledger: object = Field(exclude=True)
@@ -273,16 +299,20 @@ class BudgetedChatModel(BaseChatModel):
             stream=False,
             truncated=truncated,
         )
+        _PERMIT.http_attempted = False
         _open_permit()
         call_kwargs = dict(kwargs)
         call_kwargs["max_tokens"] = max_tokens
         try:
             result = self.inner._generate(prepared, stop=stop, run_manager=run_manager, **call_kwargs)
         except Exception:
-            self.ledger.abort(index)
+            self.ledger.abort(index, sent=bool(getattr(_PERMIT, "http_attempted", False)))
             raise
         else:
-            self.ledger.settle(index, _usage_from_result(result))
+            self.ledger.settle(
+                index, _usage_from_result(result), sent=bool(getattr(_PERMIT, "http_attempted", False)),
+            )
+            _mark_finish(self.ledger, index, result)
             return result
         finally:
             _close_permit()
